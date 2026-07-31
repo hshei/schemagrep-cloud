@@ -1,201 +1,235 @@
-import { generateKeyPairSync, randomUUID } from "node:crypto";
-import {
-  chmodSync,
-  closeSync,
-  fsyncSync,
-  linkSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { join } from "node:path";
-import Provider, { type Configuration } from "oidc-provider";
+import { WorkOS } from "@workos-inc/node";
 import type { AuthInfo } from "@modelcontextprotocol/server";
-import { CLI_CLIENT_ID, CLI_REDIRECT_URI, OAUTH_SCOPES } from "./constants";
-import { PersistentOAuthAdapter, PersistentOAuthAdapterRepository } from "./adapter";
+import { createRemoteJWKSet, jwtVerify, type RemoteJWKSet } from "jose";
+import type { WorkOSConfig } from "../config";
+import {
+  CLI_CLIENT_METADATA_PATH,
+  CLI_REDIRECT_URI,
+  OAUTH_SCOPES,
+  RESOURCE_PERMISSIONS,
+} from "./constants";
 
-const SIGNING_KEY_FILENAME = "signing-key.json";
+const METADATA_CACHE_MS = 5 * 60 * 1000;
+const SESSION_COOKIE_NAME = "sg_session";
+const LOGIN_STATE_COOKIE_NAME = "sg_login_state";
 
-function readSigningKey(path: string): JsonWebKey {
-  const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-  if (
-    typeof parsed !== "object" ||
-    parsed === null ||
-    Array.isArray(parsed) ||
-    (parsed as JsonWebKey).kty !== "RSA" ||
-    typeof (parsed as JsonWebKey).n !== "string" ||
-    typeof (parsed as JsonWebKey).e !== "string" ||
-    typeof (parsed as JsonWebKey).d !== "string"
-  ) {
-    throw new Error(`Stored OAuth signing key is invalid: ${path}`);
-  }
-  chmodSync(path, 0o600);
-  return parsed as JsonWebKey;
+export { LOGIN_STATE_COOKIE_NAME, SESSION_COOKIE_NAME };
+
+export interface AuthenticatedIdentity {
+  tenantId: string;
+  authInfo: AuthInfo;
+  email?: string;
+  name?: string;
 }
 
-function loadOrCreateSigningKey(storageDirectory: string): JsonWebKey {
-  mkdirSync(storageDirectory, { recursive: true, mode: 0o700 });
-  const path = join(storageDirectory, SIGNING_KEY_FILENAME);
-  try {
-    return readSigningKey(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-
-  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
-  const jwk = privateKey.export({ format: "jwk" });
-  const temporaryPath = `${path}.${randomUUID()}.tmp`;
-  const descriptor = openSync(temporaryPath, "wx", 0o600);
-  try {
-    writeFileSync(descriptor, `${JSON.stringify(jwk)}\n`, "utf8");
-    fsyncSync(descriptor);
-  } finally {
-    closeSync(descriptor);
-  }
-  try {
-    linkSync(temporaryPath, path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    return readSigningKey(path);
-  } finally {
-    unlinkSync(temporaryPath);
-  }
-  return jwk;
-}
-export interface OAuthServiceOptions {
-  publicBaseUrl: string;
-  cookieKey: string;
-  storageDirectory: string;
+export interface BrowserAuthentication {
+  identity: AuthenticatedIdentity;
+  sealedSession?: string;
 }
 
-export class OAuthService {
+export interface BrowserCodeAuthentication {
+  identity: AuthenticatedIdentity;
+  sealedSession: string;
+}
+
+export interface ManagedOAuthService {
   readonly issuer: string;
   readonly resourceUrl: string;
   readonly resourceMetadataUrl: string;
-  readonly provider: Provider;
+  readonly publicBaseUrl: string;
+  readonly secureCookies: boolean;
+  authenticateBearer(token: string): Promise<AuthenticatedIdentity | undefined>;
+  authenticateBrowserSession(sealedSession: string): Promise<BrowserAuthentication | undefined>;
+  authorizationUrl(state: string): string;
+  exchangeAuthorizationCode(code: string): Promise<BrowserCodeAuthentication>;
+  logoutUrl(sealedSession: string): Promise<string>;
+  protectedResourceMetadata(): Record<string, unknown>;
+  authorizationServerMetadata(): Promise<Record<string, unknown>>;
+  cliClientMetadata(): Record<string, unknown>;
+}
 
-  constructor(options: OAuthServiceOptions) {
-    const baseUrl = options.publicBaseUrl.replace(/\/+$/u, "");
-    this.issuer = `${baseUrl}/oauth`;
-    this.resourceUrl = `${baseUrl}/mcp`;
-    this.resourceMetadataUrl = `${baseUrl}/.well-known/oauth-protected-resource/mcp`;
-    const secureCookies = new URL(baseUrl).protocol === "https:";
-    const jwk = loadOrCreateSigningKey(options.storageDirectory);
-    const adapterRepository = new PersistentOAuthAdapterRepository(options.storageDirectory);
+function identity(
+  tenantId: string,
+  profile: { email?: string; name?: string } = {},
+): AuthenticatedIdentity {
+  return {
+    tenantId,
+    authInfo: {
+      token: "[validated-and-redacted]",
+      clientId: tenantId,
+      scopes: [...RESOURCE_PERMISSIONS],
+    },
+    ...(profile.email === undefined ? {} : { email: profile.email }),
+    ...(profile.name === undefined ? {} : { name: profile.name }),
+  };
+}
 
-    const configuration: Configuration = {
-      adapter: (name) => new PersistentOAuthAdapter(name, adapterRepository),
-      clients: [
-        {
-          client_id: CLI_CLIENT_ID,
-          client_name: "schemagrep terminal",
-          redirect_uris: [CLI_REDIRECT_URI],
-          response_types: ["code"],
-          grant_types: ["authorization_code", "refresh_token"],
-          token_endpoint_auth_method: "none",
-        },
-      ],
-      cookies: {
-        keys: [options.cookieKey],
-        long: { httpOnly: true, sameSite: "lax", secure: secureCookies },
-        short: { httpOnly: true, sameSite: "lax", secure: secureCookies },
-      },
-      features: {
-        devInteractions: { enabled: false },
-        registration: {
-          enabled: true,
-          issueRegistrationAccessToken: false,
-        },
-        revocation: {
-          enabled: true,
-          allowedPolicy: (_ctx, client, token) => token.clientId === client.clientId,
-        },
-        resourceIndicators: {
-          enabled: true,
-          defaultResource: () => this.resourceUrl,
-          useGrantedResource: () => true,
-          getResourceServerInfo: (_ctx, resourceIndicator) => {
-            if (resourceIndicator !== this.resourceUrl) throw new Error("Unknown resource indicator");
-            return {
-              scope: OAUTH_SCOPES.join(" "),
-              audience: this.resourceUrl,
-              accessTokenFormat: "opaque",
-              accessTokenTTL: 3600,
-            };
-          },
-        },
-      },
-      interactions: {
-        url: (_ctx, interaction) => `/oauth-login/${encodeURIComponent(interaction.uid)}`,
-      },
-      pkce: { required: () => true },
-      scopes: [...OAUTH_SCOPES],
-      responseTypes: ["code"],
-      issueRefreshToken: (_ctx, client) => client.grantTypeAllowed("refresh_token"),
-      rotateRefreshToken: true,
-      ttl: {
-        AccessToken: 3600,
-        AuthorizationCode: 60,
-        Grant: 30 * 24 * 60 * 60,
-        RefreshToken: 30 * 24 * 60 * 60,
-        Interaction: 10 * 60,
-        Session: 30 * 24 * 60 * 60,
-      },
-      findAccount: (_ctx, accountId) => Promise.resolve({
-        accountId,
-        claims: () => Promise.resolve({ sub: accountId }),
-      }),
-      jwks: {
-        keys: [{ ...jwk, kid: "schemagrep-oauth", use: "sig", alg: "RS256" }],
-      },
-    };
 
-    this.provider = new Provider(this.issuer, configuration);
-    this.provider.proxy = true;
+export class WorkOSOAuthService implements ManagedOAuthService {
+  readonly issuer: string;
+  readonly resourceUrl: string;
+  readonly resourceMetadataUrl: string;
+  readonly publicBaseUrl: string;
+  readonly secureCookies: boolean;
+
+  private readonly workos: WorkOS;
+  private readonly jwks: RemoteJWKSet;
+  private authorizationMetadataCache?: {
+    value: Record<string, unknown>;
+    expiresAt: number;
+  };
+
+  constructor(publicBaseUrl: string, private readonly config: WorkOSConfig) {
+    this.publicBaseUrl = publicBaseUrl.replace(/\/+$/u, "");
+    this.issuer = config.authorizationServerUrl.replace(/\/+$/u, "");
+    this.resourceUrl = `${this.publicBaseUrl}/mcp`;
+    this.resourceMetadataUrl = `${this.publicBaseUrl}/.well-known/oauth-protected-resource/mcp`;
+    this.secureCookies = new URL(this.publicBaseUrl).protocol === "https:";
+    this.workos = new WorkOS(config.apiKey, { clientId: config.clientId });
+    this.jwks = createRemoteJWKSet(new URL(`${this.issuer}/oauth2/jwks`));
   }
 
-  metadata(): Record<string, unknown> {
+  async authenticateBearer(token: string): Promise<AuthenticatedIdentity | undefined> {
+    try {
+      const { payload } = await jwtVerify(token, this.jwks, {
+        issuer: this.issuer,
+        audience: this.resourceUrl,
+        algorithms: ["RS256"],
+        requiredClaims: ["sub"],
+        clockTolerance: 5,
+      });
+      return typeof payload.sub === "string" && payload.sub.length > 0 && payload.sub.length <= 512
+        ? identity(payload.sub)
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async authenticateBrowserSession(
+    sealedSession: string,
+  ): Promise<BrowserAuthentication | undefined> {
+    try {
+      const session = this.workos.userManagement.loadSealedSession({
+        sessionData: sealedSession,
+        cookiePassword: this.config.cookiePassword,
+      });
+      const authenticated = await session.authenticate();
+      if (authenticated.authenticated) {
+        return {
+          identity: identity(authenticated.user.id, {
+            email: authenticated.user.email,
+            ...(authenticated.user.firstName === null ? {} : { name: authenticated.user.firstName }),
+          }),
+        };
+      }
+      if (authenticated.reason === "no_session_cookie_provided") return undefined;
+      const refreshed = await session.refresh({ cookiePassword: this.config.cookiePassword });
+      if (!refreshed.authenticated || refreshed.sealedSession === undefined) return undefined;
+      return {
+        identity: identity(refreshed.user.id, {
+          email: refreshed.user.email,
+          ...(refreshed.user.firstName === null ? {} : { name: refreshed.user.firstName }),
+        }),
+        sealedSession: refreshed.sealedSession,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  authorizationUrl(state: string): string {
+    return this.workos.userManagement.getAuthorizationUrl({
+      provider: "authkit",
+      clientId: this.config.clientId,
+      redirectUri: `${this.publicBaseUrl}/callback`,
+      state,
+    });
+  }
+
+  async exchangeAuthorizationCode(code: string): Promise<BrowserCodeAuthentication> {
+    const result = await this.workos.userManagement.authenticateWithCode({
+      clientId: this.config.clientId,
+      code,
+      session: {
+        sealSession: true,
+        cookiePassword: this.config.cookiePassword,
+      },
+    });
+    if (result.sealedSession === undefined) {
+      throw new Error("WorkOS did not return a sealed browser session");
+    }
     return {
-      issuer: this.issuer,
-      authorization_endpoint: `${this.issuer}/auth`,
-      token_endpoint: `${this.issuer}/token`,
-      registration_endpoint: `${this.issuer}/reg`,
-      revocation_endpoint: `${this.issuer}/token/revocation`,
-      jwks_uri: `${this.issuer}/jwks`,
-      response_types_supported: ["code"],
-      grant_types_supported: ["authorization_code", "refresh_token"],
-      token_endpoint_auth_methods_supported: ["none"],
-      code_challenge_methods_supported: ["S256"],
-      scopes_supported: [...OAUTH_SCOPES],
+      identity: identity(result.user.id, {
+        email: result.user.email,
+        ...(result.user.firstName === null ? {} : { name: result.user.firstName }),
+      }),
+      sealedSession: result.sealedSession,
     };
+  }
+
+  async logoutUrl(sealedSession: string): Promise<string> {
+    const session = this.workos.userManagement.loadSealedSession({
+      sessionData: sealedSession,
+      cookiePassword: this.config.cookiePassword,
+    });
+    return session.getLogoutUrl({ returnTo: this.publicBaseUrl });
   }
 
   protectedResourceMetadata(): Record<string, unknown> {
     return {
       resource: this.resourceUrl,
       authorization_servers: [this.issuer],
+      bearer_methods_supported: ["header"],
       scopes_supported: [...OAUTH_SCOPES],
-      resource_name: "schemagrep cloud",
     };
   }
 
-  async verifyAccessToken(tokenValue: string): Promise<AuthInfo | undefined> {
-    const token = await this.provider.AccessToken.find(tokenValue);
+  async authorizationServerMetadata(): Promise<Record<string, unknown>> {
+    const now = Date.now();
     if (
-      token === undefined ||
-      token.accountId === undefined ||
-      token.exp === undefined ||
-      token.exp <= Math.floor(Date.now() / 1000)
+      this.authorizationMetadataCache !== undefined &&
+      this.authorizationMetadataCache.expiresAt > now
     ) {
-      return undefined;
+      return { ...this.authorizationMetadataCache.value };
     }
+    const response = await fetch(`${this.issuer}/.well-known/oauth-authorization-server`, {
+      signal: AbortSignal.timeout(10_000),
+      headers: { accept: "application/json" },
+    });
+    if (!response.ok) {
+      throw new Error(`WorkOS authorization metadata request failed with ${response.status}`);
+    }
+    const metadataValue: unknown = await response.json();
+    if (
+      typeof metadataValue !== "object" ||
+      metadataValue === null ||
+      Array.isArray(metadataValue)
+    ) {
+      throw new Error("WorkOS authorization metadata is invalid");
+    }
+    const metadata = metadataValue as Record<string, unknown>;
+    if (metadata.issuer !== this.issuer) {
+      throw new Error("WorkOS authorization metadata issuer does not match configuration");
+    }
+    this.authorizationMetadataCache = {
+      value: { ...metadata },
+      expiresAt: now + METADATA_CACHE_MS,
+    };
+    return { ...metadata };
+  }
+
+  cliClientMetadata(): Record<string, unknown> {
+    const clientId = `${this.publicBaseUrl}${CLI_CLIENT_METADATA_PATH}`;
     return {
-      token: "[validated-and-redacted]",
-      clientId: token.accountId,
-      scopes: token.scope?.split(" ").filter(Boolean) ?? [],
-      expiresAt: token.exp,
+      client_id: clientId,
+      client_name: "schemagrep terminal",
+      client_uri: this.publicBaseUrl,
+      redirect_uris: [CLI_REDIRECT_URI],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+      scope: OAUTH_SCOPES.join(" "),
     };
   }
 }

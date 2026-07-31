@@ -47,5 +47,6 @@ export interface FileService {
     request: StructuredQueryRequest,
   ): Promise<StructuredQueryResponse | undefined>;
   delete(id: string, ownerId: string): Promise<boolean>;
+  ready?(): Promise<void>;
   close(): Promise<void>;
 }

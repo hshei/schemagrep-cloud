@@ -2,9 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app";
-import type { ServiceConfig } from "../src/config";
 import type { FileService, PublicFileRecord, UploadSource } from "../src/files/types";
 import type { StructuredQueryRequest, StructuredQueryResponse } from "../src/query/contract";
+import { testConfig } from "./support/config";
+import { TestManagedOAuthService } from "./support/managed-oauth";
 
 const FILE_ID = "file_0123456789abcdef0123456789abcdef";
 const ALPHA_KEY = "alpha-secret-0123456789abcdef0123456789";
@@ -19,29 +20,13 @@ const RECORD: PublicFileRecord = {
   createdAt: "2026-07-29T00:00:00.000Z",
   expiresAt: "2026-07-29T01:00:00.000Z",
 };
-const CONFIG: ServiceConfig = {
-  host: "127.0.0.1",
-  port: 3000,
-  schemagrepBinary: "schemagrep",
+const CONFIG = testConfig({
   storageBaseDirectory: "/tmp/schemagrep-cloud-mcp-tests",
-  fileTtlMs: 3_600_000,
-  processTimeoutMs: 30_000,
-  maxUploadBytes: 1024,
-  maxArtifactBytes: 4096,
-  maxSchemaBytes: 4096,
-  maxQueryOutputBytes: 4096,
-  authDisabled: false,
-  apiCredentials: [
-    { tenantId: "alpha", secret: ALPHA_KEY },
-    { tenantId: "beta", secret: BETA_KEY },
-  ],
-  rateLimitMax: 100,
-  rateLimitWindowMs: 60_000,
-  maxTenantStorageBytes: 4096,
-  workerSandbox: "disabled",
-  bubblewrapBinary: "/usr/bin/bwrap",
-  mcpAllowedHostnames: ["localhost", "127.0.0.1"],
-};
+});
+const OAUTH = new TestManagedOAuthService(
+  "http://127.0.0.1:3199",
+  { [ALPHA_KEY]: "alpha", [BETA_KEY]: "beta" },
+);
 
 class McpFileService implements FileService {
   async ingest(_source: UploadSource, _ownerId: string): Promise<PublicFileRecord> {
@@ -107,7 +92,7 @@ async function connectClient(endpoint: URL, token: string, name: string): Promis
 
 describe("schemagrep MCP endpoint", () => {
   test("authenticates a real Streamable HTTP client and isolates every tool by tenant", async () => {
-    app = buildApp({ config: CONFIG, fileService: new McpFileService() });
+    app = buildApp({ config: CONFIG, fileService: new McpFileService(), oauthService: OAUTH });
     const address = await app.listen({ host: "127.0.0.1", port: 0 });
     const endpoint = new URL("/mcp", address);
 
@@ -197,7 +182,7 @@ describe("schemagrep MCP endpoint", () => {
   });
 
   test("rejects unapproved Host headers before MCP dispatch", async () => {
-    app = buildApp({ config: CONFIG, fileService: new McpFileService() });
+    app = buildApp({ config: CONFIG, fileService: new McpFileService(), oauthService: OAUTH });
     const address = await app.listen({ host: "127.0.0.1", port: 0 });
 
     const response = await fetch(new URL("/mcp", address), {

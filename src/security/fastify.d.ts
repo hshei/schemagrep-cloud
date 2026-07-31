@@ -5,5 +5,8 @@ declare module "fastify" {
   interface FastifyRequest {
     tenantId: string;
     authInfo: AuthInfo | null;
+    authMethod: "disabled" | "bearer" | "session" | null;
+    userEmail: string;
+    userName: string;
   }
 }

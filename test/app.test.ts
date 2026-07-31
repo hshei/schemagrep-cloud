@@ -4,10 +4,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app";
-import { loadConfig } from "../src/config";
 import { summarizeProductTelemetry } from "../src/telemetry/product";
+import { testConfig } from "./support/config";
+import { TestManagedOAuthService } from "./support/managed-oauth";
 
-const BETA_KEY = "beta-dashboard-test-0123456789abcdef";
+const MANAGED_TOKEN = "managed-dashboard-access-token";
 const temporaryDirectories: string[] = [];
 let app: FastifyInstance | undefined;
 
@@ -18,9 +19,9 @@ afterEach(async () => {
     rm(path, { recursive: true, force: true })));
 });
 
-describe("hosted beta application", () => {
+describe("hosted managed application", () => {
   test("reports service readiness", async () => {
-    app = buildApp({ config: loadConfig({ AUTH_DISABLED: "true" }) });
+    app = buildApp({ config: testConfig({ authDisabled: true }) });
 
     const response = await app.inject({ method: "GET", url: "/health" });
 
@@ -34,9 +35,8 @@ describe("hosted beta application", () => {
 
   test("serves a public dashboard with isolated browser assets", async () => {
     app = buildApp({
-      config: loadConfig({
-        SCHEMAGREP_API_KEYS: JSON.stringify({ beta: BETA_KEY }),
-      }),
+      config: testConfig(),
+      oauthService: new TestManagedOAuthService(),
     });
 
     const page = await app.inject({ method: "GET", url: "/" });
@@ -49,7 +49,7 @@ describe("hosted beta application", () => {
     expect(page.headers["cache-control"]).toBe("no-store");
     expect(page.headers["content-security-policy"]).toContain("default-src 'none'");
     expect(page.headers["x-frame-options"]).toBe("DENY");
-    expect(page.body).toContain("Unlock your workspace");
+    expect(page.body).toContain("Sign in to your workspace");
     expect(page.body).toContain("Raw upload");
     expect(stylesheet.statusCode).toBe(200);
     expect(stylesheet.headers["content-type"]).toContain("text/css");
@@ -60,31 +60,36 @@ describe("hosted beta application", () => {
     expect(font.headers["cache-control"]).toContain("immutable");
   });
 
-  test("validates an invite without exposing the tenant and records aggregate use", async () => {
+  test("reports managed session status without exposing the tenant and records aggregate use", async () => {
     const directory = await mkdtemp(join(tmpdir(), "schemagrep-cloud-app-test-"));
     temporaryDirectories.push(directory);
     const telemetryPath = join(directory, "metrics", "product.jsonl");
+    const oauthService = new TestManagedOAuthService(
+      "http://127.0.0.1:3199",
+      { [MANAGED_TOKEN]: "managed-user-subject" },
+    );
     app = buildApp({
-      config: loadConfig({
-        SCHEMAGREP_API_KEYS: JSON.stringify({ beta: BETA_KEY }),
-        PRODUCT_TELEMETRY_PATH: telemetryPath,
-        PRODUCT_TELEMETRY_HASH_KEY: "dashboard-telemetry-test-0123456789abcdef",
+      config: testConfig({
+        productTelemetryPath: telemetryPath,
+        productTelemetryHashKey: "dashboard-telemetry-test-0123456789abcdef",
       }),
+      oauthService,
     });
 
     const unauthorized = await app.inject({ method: "GET", url: "/v1/session" });
     const authorized = await app.inject({
       method: "GET",
       url: "/v1/session",
-      headers: { authorization: `Bearer ${BETA_KEY}` },
+      headers: { authorization: `Bearer ${MANAGED_TOKEN}` },
     });
     await app.close();
     app = undefined;
 
-    expect(unauthorized.statusCode).toBe(401);
+    expect(unauthorized.statusCode).toBe(200);
+    expect(JSON.parse(unauthorized.body)).toEqual({ authenticated: false, oauth: true });
     expect(authorized.statusCode).toBe(200);
-    expect(JSON.parse(authorized.body)).toEqual({ authenticated: true, oauth: false });
-    expect(authorized.body).not.toContain("beta");
+    expect(JSON.parse(authorized.body)).toEqual({ authenticated: true, oauth: true });
+    expect(authorized.body).not.toContain("managed-user-subject");
     expect(await summarizeProductTelemetry(telemetryPath)).toMatchObject({
       events: 1,
       activeTenants: 1,

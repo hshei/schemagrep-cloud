@@ -6,6 +6,8 @@ import { Readable } from "node:stream";
 import {
   EmptyUploadError,
   InvalidFilenameError,
+  ServiceStorageCapacityError,
+  TenantFileLimitError,
   TenantStorageQuotaError,
   UnsupportedFileTypeError,
 } from "../src/files/errors";
@@ -49,9 +51,15 @@ afterEach(async () => {
 });
 
 const OWNER_ID = "tenant-a";
+const CAPACITY = {
+  maxTotalStorageBytes: 65_536,
+  maxActiveFilesPerTenant: 20,
+  maxActiveFilesTotal: 100,
+  minFreeStorageBytes: 0,
+};
 
 describe("PersistentFileService", () => {
-  test("retains only encoded and schema artifacts, then expires both", async () => {
+  test("retains only query artifacts and metadata, then expires them", async () => {
     const storageBaseDirectory = await mkdtemp(join(tmpdir(), "schemagrep-service-test-"));
     temporaryDirectories.push(storageBaseDirectory);
     const abandonedDirectory = join(storageBaseDirectory, "instance-abandoned");
@@ -64,6 +72,7 @@ describe("PersistentFileService", () => {
       fileTtlMs: 1000,
       maxUploadBytes: 1024,
       maxTenantStorageBytes: 4096,
+      ...CAPACITY,
       runner,
       now: () => now,
     });
@@ -100,8 +109,8 @@ describe("PersistentFileService", () => {
     expect(await service.delete(record.id, "tenant-b")).toBe(false);
     expect(await service.get(record.id, OWNER_ID)).toEqual(record);
 
-    expect(await readdir(storageBaseDirectory)).toEqual(["files"]);
     const filesDirectory = join(storageBaseDirectory, "files");
+    expect(await readdir(storageBaseDirectory)).toEqual(["files"]);
     expect(await readdir(filesDirectory)).toEqual([record.id]);
     const retainedArtifacts = (await readdir(join(filesDirectory, record.id))).sort();
     expect(retainedArtifacts).toEqual(["artifact.sg", "metadata.json", "schema.txt"]);
@@ -112,20 +121,20 @@ describe("PersistentFileService", () => {
     await service.close();
   });
 
-  test("recovers tenant metadata and artifacts after a service restart", async () => {
+  test("reloads active file metadata and artifacts after restart", async () => {
     const storageBaseDirectory = await mkdtemp(join(tmpdir(), "schemagrep-service-test-"));
     temporaryDirectories.push(storageBaseDirectory);
     const now = Date.parse("2026-07-29T00:00:00.000Z");
-    const options = {
+    const first = new PersistentFileService({
       storageBaseDirectory,
       fileTtlMs: 60_000,
       maxUploadBytes: 1024,
       maxTenantStorageBytes: 4096,
+      ...CAPACITY,
       runner: new FakeProcessor(),
       now: () => now,
-    };
-    const firstService = new PersistentFileService(options);
-    const record = await firstService.ingest(
+    });
+    const record = await first.ingest(
       {
         filename: "events.jsonl",
         stream: Readable.from(['{"id":1}\n']),
@@ -133,18 +142,30 @@ describe("PersistentFileService", () => {
       },
       OWNER_ID,
     );
-    const usageBeforeRestart = await firstService.usage(OWNER_ID);
-    await firstService.close();
+    await first.close();
 
-    const restartedService = new PersistentFileService(options);
-    expect(await restartedService.list(OWNER_ID)).toEqual([record]);
-    expect(await restartedService.get(record.id, OWNER_ID)).toEqual(record);
-    expect(await restartedService.get(record.id, "tenant-b")).toBeUndefined();
-    expect(await restartedService.readSchema(record.id, OWNER_ID)).toBe("[schema]\n");
-    expect(await restartedService.usage(OWNER_ID)).toEqual(usageBeforeRestart);
-    await restartedService.close();
-
-    expect(await readdir(join(storageBaseDirectory, "files"))).toEqual([record.id]);
+    const runner = new FakeProcessor();
+    const restarted = new PersistentFileService({
+      storageBaseDirectory,
+      fileTtlMs: 60_000,
+      maxUploadBytes: 1024,
+      maxTenantStorageBytes: 4096,
+      ...CAPACITY,
+      runner,
+      now: () => now,
+    });
+    const query: StructuredQueryRequest = { mode: "rows", target: null, filters: [] };
+    expect(await restarted.list(OWNER_ID)).toEqual([record]);
+    expect(await restarted.readSchema(record.id, OWNER_ID)).toBe("[schema]\n");
+    expect(await restarted.query(record.id, OWNER_ID, query)).toMatchObject({ answer: "5" });
+    expect(await restarted.usage(OWNER_ID)).toMatchObject({
+      activeFiles: 1,
+      sourceBytes: 9,
+      retainedBytes: 26,
+    });
+    expect(runner.encodeCalls).toBe(0);
+    expect(runner.schemaCalls).toBe(0);
+    await restarted.close();
   });
 
   test("rejects path-like and control-character filenames", async () => {
@@ -156,6 +177,7 @@ describe("PersistentFileService", () => {
       maxUploadBytes: 1024,
       maxTenantStorageBytes: 4096,
       runner: new FakeProcessor(),
+      ...CAPACITY,
     });
 
     for (const filename of ["../../events.jsonl", "..\\..\\events.jsonl", "\0events.jsonl"]) {
@@ -185,6 +207,7 @@ describe("PersistentFileService", () => {
       maxUploadBytes: 1024,
       maxTenantStorageBytes: 4096,
       runner,
+      ...CAPACITY,
     });
 
     await expect(
@@ -212,6 +235,7 @@ describe("PersistentFileService", () => {
       maxUploadBytes: 1024,
       maxTenantStorageBytes: 30,
       runner: new FakeProcessor(),
+      ...CAPACITY,
     });
     const ingest = (ownerId: string) =>
       service.ingest(
@@ -243,6 +267,7 @@ describe("PersistentFileService", () => {
       maxUploadBytes: 1024,
       maxTenantStorageBytes: 4096,
       runner: new FakeProcessor(),
+      ...CAPACITY,
     });
 
     const ingest = service.ingest(
@@ -257,5 +282,45 @@ describe("PersistentFileService", () => {
     await expect(ingest).rejects.toBeInstanceOf(UnsupportedFileTypeError);
     expect(await readdir(storageBaseDirectory)).toEqual([]);
     await service.close();
+  });
+
+  test("enforces per-tenant file and global retained-storage capacity", async () => {
+    const storageBaseDirectory = await mkdtemp(join(tmpdir(), "schemagrep-service-test-"));
+    temporaryDirectories.push(storageBaseDirectory);
+    const service = new PersistentFileService({
+      storageBaseDirectory,
+      fileTtlMs: 60_000,
+      maxUploadBytes: 1024,
+      maxTenantStorageBytes: 4096,
+      ...CAPACITY,
+      maxActiveFilesPerTenant: 1,
+      runner: new FakeProcessor(),
+    });
+    const ingest = (target: PersistentFileService, ownerId: string) => target.ingest(
+      {
+        filename: "events.jsonl",
+        stream: Readable.from(['{"id":1}\n']),
+        wasTruncated: () => false,
+      },
+      ownerId,
+    );
+    await ingest(service, OWNER_ID);
+    await expect(ingest(service, OWNER_ID)).rejects.toBeInstanceOf(TenantFileLimitError);
+    await service.close();
+
+    const constrainedDirectory = await mkdtemp(join(tmpdir(), "schemagrep-service-test-"));
+    temporaryDirectories.push(constrainedDirectory);
+    const storageCapacity = new PersistentFileService({
+      storageBaseDirectory: constrainedDirectory,
+      fileTtlMs: 60_000,
+      maxUploadBytes: 1024,
+      maxTenantStorageBytes: 4096,
+      ...CAPACITY,
+      maxTotalStorageBytes: 25,
+      runner: new FakeProcessor(),
+    });
+    await expect(ingest(storageCapacity, "other"))
+      .rejects.toBeInstanceOf(ServiceStorageCapacityError);
+    await storageCapacity.close();
   });
 });

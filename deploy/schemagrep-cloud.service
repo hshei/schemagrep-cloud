@@ -1,0 +1,45 @@
+[Unit]
+Description=schemagrep managed MCP service
+Documentation=https://github.com/hshei/schemagrep-cloud
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=schemagrep
+Group=schemagrep
+WorkingDirectory=/opt/schemagrep-cloud/current
+EnvironmentFile=/etc/schemagrep-cloud.env
+ExecStart=/usr/local/bin/bun run start
+Restart=on-failure
+RestartSec=3s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillMode=mixed
+
+# Bubblewrap creates the worker namespaces. The outer service still gets a
+# read-only host view and one explicit persistent-data write path.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/schemagrep-cloud
+UMask=0077
+
+# Backstop limits; application-level worker and byte limits remain authoritative.
+TasksMax=128
+LimitNOFILE=65536
+MemoryMax=6G
+MemorySwapMax=0
+
+[Install]
+WantedBy=multi-user.target

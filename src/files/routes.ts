@@ -4,6 +4,8 @@ import {
   InvalidFilenameError,
   InvalidQueryError,
   SchemagrepProcessError,
+  ServiceStorageCapacityError,
+  TenantFileLimitError,
   TenantStorageQuotaError,
   UnsupportedFileTypeError,
   UploadTooLargeError,
@@ -60,6 +62,24 @@ function sendKnownError(error: unknown, reply: FastifyReply): boolean {
     });
     return true;
   }
+  if (error instanceof TenantFileLimitError) {
+    void reply.header("retry-after", "60").code(429).send({
+      error: {
+        code: "active_file_limit_exceeded",
+        message: "Delete a file or wait for one to expire before uploading another",
+      },
+    });
+    return true;
+  }
+  if (error instanceof ServiceStorageCapacityError) {
+    void reply.header("retry-after", "60").code(503).send({
+      error: {
+        code: "storage_capacity_unavailable",
+        message: "Service storage capacity is temporarily unavailable",
+      },
+    });
+    return true;
+  }
   if (error instanceof UnsupportedFileTypeError) {
     void reply.code(415).send({
       error: {
@@ -76,6 +96,12 @@ function sendKnownError(error: unknown, reply: FastifyReply): boolean {
     return true;
   }
   if (error instanceof SchemagrepProcessError) {
+    if (error.kind === "busy") {
+      void reply.header("retry-after", "1").code(503).send({
+        error: { code: "processor_busy", message: "File processor capacity is saturated" },
+      });
+      return true;
+    }
     if (error.kind === "output_limit") {
       void reply.code(413).send({
         error: { code: "artifact_too_large", message: "Generated artifact exceeds the service limit" },
@@ -106,6 +132,12 @@ function sendQueryError(error: unknown, reply: FastifyReply): boolean {
     return true;
   }
   if (!(error instanceof SchemagrepProcessError)) return false;
+  if (error.kind === "busy") {
+    void reply.header("retry-after", "1").code(503).send({
+      error: { code: "processor_busy", message: "Query processor capacity is saturated" },
+    });
+    return true;
+  }
   if (error.kind === "output_limit") {
     void reply.code(413).send({
       error: { code: "query_output_too_large", message: "Query output exceeds the service limit" },

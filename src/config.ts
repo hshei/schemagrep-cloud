@@ -4,11 +4,12 @@ import { fileURLToPath } from "node:url";
 
 const MEBIBYTE = 1024 * 1024;
 
-const TENANT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-
-export interface ApiCredentialConfig {
-  tenantId: string;
-  secret: string;
+export interface WorkOSConfig {
+  apiKey: string;
+  clientId: string;
+  authorizationServerUrl: string;
+  cookiePassword: string;
+  csrfSecret: string;
 }
 
 export type WorkerSandboxMode = "bwrap" | "disabled";
@@ -25,16 +26,21 @@ export interface ServiceConfig {
   maxSchemaBytes: number;
   maxQueryOutputBytes: number;
   authDisabled: boolean;
-  apiCredentials: readonly ApiCredentialConfig[];
+  workos?: WorkOSConfig;
   rateLimitMax: number;
   rateLimitWindowMs: number;
   maxTenantStorageBytes: number;
+  maxTotalStorageBytes: number;
+  maxActiveFilesPerTenant: number;
+  maxActiveFilesTotal: number;
+  minFreeStorageBytes: number;
+  maxActiveWorkers: number;
+  maxQueuedWorkers: number;
   workerSandbox: WorkerSandboxMode;
   bubblewrapBinary: string;
   mcpAllowedHostnames: readonly string[];
   trustedProxyClientIpHeader?: string;
   publicBaseUrl?: string;
-  oauthCookieKey?: string;
   productTelemetryPath?: string;
   productTelemetryHashKey?: string;
   feedbackPath?: string;
@@ -103,40 +109,81 @@ function parseTrustedProxyClientIpHeader(value: string | undefined): string | un
   return header;
 }
 
-function parseOAuthConfig(env: NodeJS.ProcessEnv): {
-  publicBaseUrl?: string;
-  oauthCookieKey?: string;
-} {
-  const rawBaseUrl = env.PUBLIC_BASE_URL;
-  const cookieKey = env.OAUTH_COOKIE_KEY;
-  if (rawBaseUrl === undefined && cookieKey === undefined) return {};
-  if (rawBaseUrl === undefined || cookieKey === undefined) {
-    throw new Error("PUBLIC_BASE_URL and OAUTH_COOKIE_KEY must be configured together");
-  }
-  let baseUrl: URL;
+function parseOrigin(
+  name: string,
+  value: string,
+  allowLoopbackHttp: boolean,
+): string {
+  let url: URL;
   try {
-    baseUrl = new URL(rawBaseUrl);
+    url = new URL(value);
   } catch {
-    throw new Error("PUBLIC_BASE_URL must be an absolute URL");
+    throw new Error(`${name} must be an absolute URL`);
   }
+  const loopbackHttp = allowLoopbackHttp &&
+    url.protocol === "http:" &&
+    ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
   if (
-    (baseUrl.protocol !== "https:" &&
-      !(baseUrl.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(baseUrl.hostname))) ||
-    baseUrl.username.length > 0 ||
-    baseUrl.password.length > 0 ||
-    baseUrl.search.length > 0 ||
-    baseUrl.hash.length > 0
+    (url.protocol !== "https:" && !loopbackHttp) ||
+    url.username.length > 0 ||
+    url.password.length > 0 ||
+    url.search.length > 0 ||
+    url.hash.length > 0
   ) {
-    throw new Error("PUBLIC_BASE_URL must be HTTPS, except for loopback development");
+    throw new Error(`${name} must be HTTPS${allowLoopbackHttp ? ", except for loopback development" : ""}`);
   }
-  if (baseUrl.pathname !== "/") {
-    throw new Error("PUBLIC_BASE_URL must not contain a path");
+  if (url.pathname !== "/") throw new Error(`${name} must not contain a path`);
+  return url.href.replace(/\/$/u, "");
+}
+
+function requiredSecret(
+  name: string,
+  value: string | undefined,
+  minimumBytes = 1,
+): string {
+  if (
+    value === undefined ||
+    Buffer.byteLength(value, "utf8") < minimumBytes ||
+    Buffer.byteLength(value, "utf8") > 512
+  ) {
+    throw new Error(`${name} must contain ${minimumBytes} to 512 UTF-8 bytes`);
   }
-  if (Buffer.byteLength(cookieKey, "utf8") < 32 || Buffer.byteLength(cookieKey, "utf8") > 512) {
-    throw new Error("OAUTH_COOKIE_KEY must contain 32 to 512 UTF-8 bytes");
+  return value;
+}
+
+function parseWorkOSConfig(
+  env: NodeJS.ProcessEnv,
+  authDisabled: boolean,
+): { publicBaseUrl?: string; workos?: WorkOSConfig } {
+  const names = [
+    "PUBLIC_BASE_URL",
+    "WORKOS_API_KEY",
+    "WORKOS_CLIENT_ID",
+    "WORKOS_AUTHKIT_URL",
+    "WORKOS_COOKIE_PASSWORD",
+    "CSRF_SECRET",
+  ] as const;
+  const configured = names.some((name) => env[name] !== undefined);
+  if (!configured && authDisabled) return {};
+  if (!configured) {
+    throw new Error(
+      "Managed authentication is required unless AUTH_DISABLED=true; configure " +
+      names.join(", "),
+    );
   }
-  baseUrl.pathname = baseUrl.pathname.replace(/\/+$/u, "");
-  return { publicBaseUrl: baseUrl.href.replace(/\/$/u, ""), oauthCookieKey: cookieKey };
+  for (const name of names) {
+    if (env[name] === undefined) throw new Error(`${name} is required for managed authentication`);
+  }
+  return {
+    publicBaseUrl: parseOrigin("PUBLIC_BASE_URL", env.PUBLIC_BASE_URL!, true),
+    workos: {
+      apiKey: requiredSecret("WORKOS_API_KEY", env.WORKOS_API_KEY),
+      clientId: requiredSecret("WORKOS_CLIENT_ID", env.WORKOS_CLIENT_ID),
+      authorizationServerUrl: parseOrigin("WORKOS_AUTHKIT_URL", env.WORKOS_AUTHKIT_URL!, false),
+      cookiePassword: requiredSecret("WORKOS_COOKIE_PASSWORD", env.WORKOS_COOKIE_PASSWORD, 32),
+      csrfSecret: requiredSecret("CSRF_SECRET", env.CSRF_SECRET, 32),
+    },
+  };
 }
 
 function parseProductTelemetry(env: NodeJS.ProcessEnv): {
@@ -181,61 +228,22 @@ function parseFeedbackConfig(env: NodeJS.ProcessEnv): {
   };
 }
 
-function parseApiCredentials(value: string | undefined, authDisabled: boolean): ApiCredentialConfig[] {
-  if (authDisabled && value === undefined) return [];
-  if (value === undefined) {
-    throw new Error(
-      "SCHEMAGREP_API_KEYS is required unless AUTH_DISABLED=true. " +
-        'Use a JSON object such as {\"local\":\"a-secret-with-at-least-32-bytes\"}.',
-    );
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    throw new Error("SCHEMAGREP_API_KEYS must be a valid JSON object");
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("SCHEMAGREP_API_KEYS must be a JSON object mapping tenant IDs to secrets");
-  }
-
-  const credentials: ApiCredentialConfig[] = [];
-  const seenSecrets = new Set<string>();
-  for (const [tenantId, secret] of Object.entries(parsed)) {
-    if (!TENANT_ID_PATTERN.test(tenantId)) {
-      throw new Error(`Invalid tenant ID in SCHEMAGREP_API_KEYS: ${tenantId}`);
-    }
-    if (
-      typeof secret !== "string" ||
-      Buffer.byteLength(secret, "utf8") < 32 ||
-      Buffer.byteLength(secret, "utf8") > 512
-    ) {
-      throw new Error(`API key for tenant ${tenantId} must contain 32 to 512 UTF-8 bytes`);
-    }
-    if (seenSecrets.has(secret)) {
-      throw new Error("Each tenant in SCHEMAGREP_API_KEYS must use a unique API key");
-    }
-    seenSecrets.add(secret);
-    credentials.push({ tenantId, secret });
-  }
-
-  if (!authDisabled && credentials.length === 0) {
-    throw new Error("SCHEMAGREP_API_KEYS must configure at least one tenant");
-  }
-  if (credentials.length > 100) {
-    throw new Error("SCHEMAGREP_API_KEYS supports at most 100 tenants");
-  }
-  return credentials;
-}
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig {
   const authDisabled = parseBoolean("AUTH_DISABLED", env.AUTH_DISABLED, false);
-  const apiCredentials = parseApiCredentials(env.SCHEMAGREP_API_KEYS, authDisabled);
+  const managedAuthConfig = parseWorkOSConfig(env, authDisabled);
   const host = env.HOST ?? "127.0.0.1";
+  if (
+    authDisabled &&
+    host !== "127.0.0.1" &&
+    host !== "::1" &&
+    host.toLowerCase() !== "localhost"
+  ) {
+    throw new Error("AUTH_DISABLED=true requires HOST to be loopback-only");
+  }
   const productTelemetry = parseProductTelemetry(env);
   const feedbackConfig = parseFeedbackConfig(env);
-  const oauthConfig = parseOAuthConfig(env);
+  const workosConfig = managedAuthConfig;
   const trustedProxyClientIpHeader = parseTrustedProxyClientIpHeader(
     env.TRUSTED_PROXY_CLIENT_IP_HEADER,
   );
@@ -246,6 +254,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig 
     1,
     1024 * MEBIBYTE,
   );
+  const maxTenantStorageBytes = parseInteger(
+    "MAX_TENANT_STORAGE_BYTES",
+    env.MAX_TENANT_STORAGE_BYTES,
+    512 * MEBIBYTE,
+    1,
+    100 * 1024 * MEBIBYTE,
+  );
+  const maxTotalStorageBytes = parseInteger(
+    "MAX_TOTAL_STORAGE_BYTES",
+    env.MAX_TOTAL_STORAGE_BYTES,
+    Math.max(16 * 1024 * MEBIBYTE, maxTenantStorageBytes),
+    1,
+    1024 * 1024 * MEBIBYTE,
+  );
+  if (maxTotalStorageBytes < maxTenantStorageBytes) {
+    throw new Error("MAX_TOTAL_STORAGE_BYTES must be at least MAX_TENANT_STORAGE_BYTES");
+  }
 
   return {
     host,
@@ -285,7 +310,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig 
       64 * MEBIBYTE,
     ),
     authDisabled,
-    apiCredentials,
+    ...workosConfig,
     rateLimitMax: parseInteger("RATE_LIMIT_MAX", env.RATE_LIMIT_MAX, 60, 1, 10_000),
     rateLimitWindowMs: parseInteger(
       "RATE_LIMIT_WINDOW_MS",
@@ -294,18 +319,47 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig 
       1000,
       3_600_000,
     ),
-    maxTenantStorageBytes: parseInteger(
-      "MAX_TENANT_STORAGE_BYTES",
-      env.MAX_TENANT_STORAGE_BYTES,
-      512 * MEBIBYTE,
+    maxTenantStorageBytes,
+    maxTotalStorageBytes,
+    maxActiveFilesPerTenant: parseInteger(
+      "MAX_ACTIVE_FILES_PER_TENANT",
+      env.MAX_ACTIVE_FILES_PER_TENANT,
+      20,
       1,
+      10_000,
+    ),
+    maxActiveFilesTotal: parseInteger(
+      "MAX_ACTIVE_FILES_TOTAL",
+      env.MAX_ACTIVE_FILES_TOTAL,
+      1000,
+      1,
+      100_000,
+    ),
+    minFreeStorageBytes: parseInteger(
+      "MIN_FREE_STORAGE_BYTES",
+      env.MIN_FREE_STORAGE_BYTES,
+      1024 * MEBIBYTE,
+      0,
       100 * 1024 * MEBIBYTE,
+    ),
+    maxActiveWorkers: parseInteger(
+      "MAX_ACTIVE_WORKERS",
+      env.MAX_ACTIVE_WORKERS,
+      4,
+      1,
+      128,
+    ),
+    maxQueuedWorkers: parseInteger(
+      "MAX_QUEUED_WORKERS",
+      env.MAX_QUEUED_WORKERS,
+      16,
+      0,
+      10_000,
     ),
     workerSandbox: parseSandboxMode(env.WORKER_SANDBOX),
     bubblewrapBinary: env.BWRAP_BIN ?? "/usr/bin/bwrap",
     mcpAllowedHostnames: parseMcpAllowedHostnames(env.MCP_ALLOWED_HOSTS, host),
     ...(trustedProxyClientIpHeader === undefined ? {} : { trustedProxyClientIpHeader }),
-    ...oauthConfig,
     ...productTelemetry,
     ...feedbackConfig,
   };

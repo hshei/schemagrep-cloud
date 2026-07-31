@@ -8,12 +8,11 @@
   };
 
   const accessPanel = element("access-panel");
-  const accessForm = element("access-form");
   const accessSubmit = element("access-submit");
   const accessStatus = element("access-status");
-  const apiKeyInput = element("api-key");
   const workspace = element("workspace");
-  const forgetKey = element("forget-key");
+  const signOut = element("sign-out");
+  const accountName = element("account-name");
   const uploadForm = element("upload-form");
   const uploadSubmit = element("upload-submit");
   const uploadStatus = element("upload-status");
@@ -54,7 +53,7 @@
   const activeFiles = element("active-files");
   const usageStatus = element("usage-status");
 
-  let apiKey = "";
+  let csrfToken = "";
   let oauthEnabled = false;
   let authGeneration = 0;
   let currentDataset = null;
@@ -77,7 +76,9 @@
     return `Request failed (${response.status})`;
   };
 
-  const headers = () => ({ Authorization: `Bearer ${apiKey}` });
+  const headers = (unsafe = false) => (
+    unsafe && csrfToken.length > 0 ? { "x-csrf-token": csrfToken } : {}
+  );
 
   const copyText = async (text, target, successMessage) => {
     try {
@@ -190,60 +191,71 @@
     expiryTimer = null;
   };
 
-  accessForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
+  const openWorkspace = async (session) => {
     const generation = ++authGeneration;
-    const candidate = apiKeyInput.value.trim();
-    if (candidate.length === 0) return;
-    accessSubmit.disabled = true;
-    setStatus(accessStatus, "Checking invite…");
+    oauthEnabled = session.oauth === true;
+    if (oauthEnabled) {
+      const csrfResponse = await fetch("/csrf-token");
+      if (!csrfResponse.ok) throw new Error("CSRF token request failed");
+      const csrf = await csrfResponse.json();
+      if (typeof csrf.csrfToken !== "string" || csrf.csrfToken.length === 0) {
+        throw new Error("CSRF token response was invalid");
+      }
+      csrfToken = csrf.csrfToken;
+    }
+    if (generation !== authGeneration) return;
+    accountName.textContent = session.name || session.email || "Signed in";
+    signOut.hidden = !oauthEnabled;
+    accessPanel.hidden = true;
+    workspace.hidden = false;
+    setStatus(accessStatus, "");
+    setStatus(configStatus, "MCP clients authorize through your schemagrep account.", "success");
+    await refreshUsage();
+  };
+
+  const bootstrapSession = async () => {
+    accessSubmit.setAttribute("aria-disabled", "true");
+    setStatus(accessStatus, "Checking your session…");
     try {
-      const response = await fetch("/v1/session", {
-        headers: { Authorization: `Bearer ${candidate}` },
-      });
-      if (generation !== authGeneration) return;
+      const response = await fetch("/v1/session");
       if (!response.ok) {
-        const message = await errorMessage(response);
-        if (generation !== authGeneration) return;
-        setStatus(accessStatus, message, "error");
+        setStatus(accessStatus, await errorMessage(response), "error");
         return;
       }
       const session = await response.json();
-      if (generation !== authGeneration) return;
-      oauthEnabled = session.oauth === true;
-      apiKey = candidate;
-      apiKeyInput.value = "";
-      accessPanel.hidden = true;
-      workspace.hidden = false;
-      setStatus(accessStatus, "");
-      setStatus(configStatus, "Connected for this tab only.", "success");
-      await refreshUsage();
-      fileInput.focus();
-    } catch {
-      if (generation === authGeneration) {
-        setStatus(accessStatus, "Could not reach schemagrep. Try again.", "error");
+      if (session.authenticated !== true) {
+        setStatus(accessStatus, "Sign in to continue.");
+        return;
       }
+      await openWorkspace(session);
+    } catch {
+      setStatus(accessStatus, "Could not reach schemagrep. Try again.", "error");
     } finally {
-      if (generation === authGeneration) accessSubmit.disabled = false;
+      accessSubmit.removeAttribute("aria-disabled");
     }
-  });
+  };
 
-  forgetKey.addEventListener("click", () => {
-    authGeneration += 1;
-    apiKey = "";
-    oauthEnabled = false;
-    resetDataset(true);
-    uploadForm.reset();
-    fileLabel.textContent = "Choose a file";
-    workspace.hidden = true;
-    accessPanel.hidden = false;
-    setStatus(uploadStatus, "");
-    setStatus(configStatus, "");
-    feedbackForm.reset();
-    setStatus(feedbackStatus, "");
-    activeFiles.replaceChildren();
-    usageProgress.value = 0;
-    apiKeyInput.focus();
+  signOut.addEventListener("click", async () => {
+    if (!oauthEnabled) return;
+    signOut.disabled = true;
+    try {
+      const response = await fetch("/logout", {
+        method: "POST",
+        headers: { ...headers(true), accept: "application/json" },
+      });
+      if (!response.ok) {
+        setStatus(usageStatus, await errorMessage(response), "error");
+        return;
+      }
+      const result = await response.json();
+      window.location.assign(
+        typeof result.redirect === "string" ? result.redirect : "/",
+      );
+    } catch {
+      setStatus(usageStatus, "Sign out failed. Try again.", "error");
+    } finally {
+      signOut.disabled = false;
+    }
   });
 
   fileInput.addEventListener("change", () => {
@@ -274,7 +286,7 @@
     try {
       const response = await fetch("/v1/files", {
         method: "POST",
-        headers: headers(),
+        headers: headers(true),
         body,
       });
       if (!response.ok) {
@@ -298,7 +310,6 @@
         schemagrep: {
           type: "http",
           url: `${window.location.origin}/mcp`,
-          ...(oauthEnabled ? {} : { headers: { Authorization: `Bearer ${apiKey}` } }),
         },
       },
     };
@@ -336,7 +347,7 @@
     try {
       const response = await fetch("/v1/feedback", {
         method: "POST",
-        headers: { ...headers(), "content-type": "application/json" },
+        headers: { ...headers(true), "content-type": "application/json" },
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
@@ -359,7 +370,7 @@
     try {
       const response = await fetch(`/v1/files/${encodeURIComponent(currentDataset.id)}`, {
         method: "DELETE",
-        headers: headers(),
+        headers: headers(true),
       });
       if (!response.ok && response.status !== 404) {
         setStatus(datasetStatus, await errorMessage(response), "error");
@@ -376,4 +387,6 @@
       deleteDataset.disabled = false;
     }
   });
+
+  void bootstrapSession();
 })();

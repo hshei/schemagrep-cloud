@@ -4,10 +4,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app";
-import { loadConfig } from "../src/config";
 import { FeedbackStore, readActiveFeedback } from "../src/feedback/store";
+import { testConfig } from "./support/config";
+import { TestManagedOAuthService } from "./support/managed-oauth";
 
-const BETA_KEY = "feedback-test-secret-0123456789abcdef";
+const MANAGED_TOKEN = "managed-feedback-access-token";
 const temporaryDirectories: string[] = [];
 let app: FastifyInstance | undefined;
 
@@ -24,18 +25,20 @@ async function temporaryDirectory(): Promise<string> {
   return directory;
 }
 
-describe("opt-in beta feedback", () => {
+describe("opt-in managed feedback", () => {
   test("requires authentication and explicit consent without attaching dataset identity", async () => {
     const directory = await temporaryDirectory();
     const feedbackPath = join(directory, "feedback.jsonl");
     app = buildApp({
-      config: loadConfig({
-        SCHEMAGREP_API_KEYS: JSON.stringify({ tester: BETA_KEY }),
-        STORAGE_DIR: join(directory, "files"),
-        FEEDBACK_PATH: feedbackPath,
-        FEEDBACK_RETENTION_DAYS: "30",
-        WORKER_SANDBOX: "disabled",
+      config: testConfig({
+        storageBaseDirectory: join(directory, "files"),
+        feedbackPath,
+        feedbackRetentionMs: 30 * 24 * 60 * 60 * 1000,
       }),
+      oauthService: new TestManagedOAuthService(
+        "http://127.0.0.1:3199",
+        { [MANAGED_TOKEN]: "feedback-user" },
+      ),
     });
     const submission = {
       client: "Claude Desktop",
@@ -54,13 +57,13 @@ describe("opt-in beta feedback", () => {
     const missingConsent = await app.inject({
       method: "POST",
       url: "/v1/feedback",
-      headers: { authorization: `Bearer ${BETA_KEY}` },
+      headers: { authorization: `Bearer ${MANAGED_TOKEN}` },
       payload: { ...submission, consentToStoreText: false },
     });
     const accepted = await app.inject({
       method: "POST",
       url: "/v1/feedback",
-      headers: { authorization: `Bearer ${BETA_KEY}` },
+      headers: { authorization: `Bearer ${MANAGED_TOKEN}` },
       payload: submission,
     });
 
