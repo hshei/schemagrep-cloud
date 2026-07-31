@@ -221,9 +221,12 @@ Create a WorkOS project and AuthKit application. Configure:
 1. sign-in callback: `https://schemagrep.example.com/callback`;
 2. sign-out return URI: `https://schemagrep.example.com`;
 3. MCP OAuth resource: `https://schemagrep.example.com/mcp`;
-4. allowed scopes: `files:read`, `files:write`, `files:delete`, and
-   `offline_access`;
+4. OAuth scopes: `openid` and `offline_access`;
 5. Client ID Metadata Document support for public MCP clients.
+
+`files:read`, `files:write`, and `files:delete` are internal resource
+permissions enforced by schemagrep-cloud. Do not configure them as WorkOS OAuth
+scopes.
 
 Record the WorkOS API key, client ID, and AuthKit issuer origin. Generate the
 cookie password and CSRF secret independently with a cryptographic secret
@@ -232,21 +235,42 @@ generator; each must contain at least 32 bytes.
 ### 2. Provision the server and DNS
 
 Create the server in an Ashburn region, attach a firewall allowing TCP 22, 80,
-and 443 only, and point the domain's `A`/`AAAA` records at it. Install Bun,
-Caddy, Git, a C toolchain, `pkg-config`, PCRE2 headers, and Bubblewrap.
+and 443 only, and point the domain's `A`/`AAAA` records at it. Install Node.js
+22 LTS, Bun, Caddy, Git, a C toolchain, `pkg-config`, PCRE2 headers, Bubblewrap,
+and AppArmor tooling. The `tsx` production entry point requires `node`; Bun does
+not replace that runtime dependency.
+
+Ubuntu 24.04 restricts unprivileged user namespaces but does not currently ship
+the Bubblewrap-specific AppArmor profile. Install the pinned upstream profile
+without disabling Ubuntu's system-wide restriction:
+
+```bash
+curl -fsSL https://gitlab.com/apparmor/apparmor/-/raw/1979af7710d0f38db6680bd7c19c80902f11f969/profiles/apparmor/profiles/extras/bwrap-userns-restrict -o /tmp/bwrap-userns-restrict
+echo "634d3d3427c483f123cb5ed53b71ea13040187e07d9f67ca74421d42a6170f0e  /tmp/bwrap-userns-restrict" | sha256sum -c -
+sudo install -o root -g root -m 0644 /tmp/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+rm -f /tmp/bwrap-userns-restrict
+```
+
+The bundled engine is a private submodule. Add a read-only deploy key for
+`hshei/schemagrep` to the server's root account and configure GitHub SSH before
+initializing it. Never copy a personal GitHub private key onto the server.
 
 ```bash
 sudo useradd --system --home /var/lib/schemagrep-cloud --shell /usr/sbin/nologin schemagrep
 sudo install -d -o schemagrep -g schemagrep -m 0700 /var/lib/schemagrep-cloud
 sudo install -d -o root -g root -m 0755 /opt/schemagrep-cloud
-sudo git clone --recurse-submodules \
-  https://github.com/hshei/schemagrep-cloud.git /opt/schemagrep-cloud/current
+sudo -u schemagrep bwrap --unshare-all --ro-bind / / /usr/bin/true
+sudo git clone https://github.com/hshei/schemagrep-cloud.git /opt/schemagrep-cloud/current
 cd /opt/schemagrep-cloud/current
-sudo bun install --frozen-lockfile
-sudo bun run setup-engine
+sudo git config submodule.vendor/schemagrep.url git@github.com:hshei/schemagrep.git
+sudo git submodule update --init --recursive
+sudo /usr/local/bin/bun install --frozen-lockfile
+sudo /usr/local/bin/bun run setup-engine
 ```
 
-Ensure Bun is available at `/usr/local/bin/bun`, matching the systemd unit.
+Ensure Node.js is available as `node` and Bun is available at
+`/usr/local/bin/bun`, matching the systemd unit.
 
 ### 3. Install configuration
 
