@@ -30,7 +30,9 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 RestrictSUIDSGID=true
 LockPersonality=true
-CapabilityBoundingSet=
+# The service has no ambient host capabilities. Keep the bounding set available:
+# Bubblewrap needs namespaced capabilities while constructing the sandbox, and
+# the AppArmor bwrap profile strips them before the worker executable starts.
 AmbientCapabilities=
 ReadWritePaths=/var/lib/schemagrep-cloud
 UMask=0077
