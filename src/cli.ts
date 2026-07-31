@@ -8,7 +8,11 @@ import { basename, dirname, join } from "node:path";
 import { homedir, platform } from "node:os";
 import { promisify } from "node:util";
 import { lock } from "proper-lockfile";
-import { CLI_CLIENT_ID, CLI_REDIRECT_URI, OAUTH_SCOPES } from "./oauth/constants";
+import {
+  CLI_CLIENT_METADATA_PATH,
+  CLI_REDIRECT_URI,
+  OAUTH_SCOPES,
+} from "./oauth/constants";
 
 const execFileAsync = promisify(execFile);
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
@@ -19,7 +23,7 @@ interface CredentialProfile {
   issuer: string;
   clientId: string;
   tokenEndpoint: string;
-  revocationEndpoint: string;
+  revocationEndpoint?: string;
   resource: string;
 }
 
@@ -35,7 +39,9 @@ interface AuthorizationMetadata {
   issuer: string;
   authorization_endpoint: string;
   token_endpoint: string;
-  revocation_endpoint: string;
+  revocation_endpoint?: string;
+  registration_endpoint?: string;
+  client_id_metadata_document_supported: boolean;
 }
 
 function profilePath(): string {
@@ -193,7 +199,7 @@ async function readProfile(): Promise<CredentialProfile> {
     typeof profile.issuer !== "string" ||
     typeof profile.clientId !== "string" ||
     typeof profile.tokenEndpoint !== "string" ||
-    typeof profile.revocationEndpoint !== "string" ||
+    (profile.revocationEndpoint !== undefined && typeof profile.revocationEndpoint !== "string") ||
     typeof profile.resource !== "string"
   ) throw new Error("Stored cloud profile is invalid");
   const server = normalizeServer(profile.server);
@@ -201,7 +207,9 @@ async function readProfile(): Promise<CredentialProfile> {
   if (profile.resource !== expectedResource) throw new Error("Stored cloud profile has an invalid resource");
   validateOAuthUrl(profile.issuer, "Stored OAuth issuer");
   validateOAuthUrl(profile.tokenEndpoint, "Stored OAuth token endpoint");
-  validateOAuthUrl(profile.revocationEndpoint, "Stored OAuth revocation endpoint");
+  if (profile.revocationEndpoint !== undefined) {
+    validateOAuthUrl(profile.revocationEndpoint, "Stored OAuth revocation endpoint");
+  }
   return profile as CredentialProfile;
 }
 
@@ -318,6 +326,10 @@ async function requestJson(url: string, init?: RequestInit): Promise<Record<stri
 async function revokeAndDeleteCredentials(profile: CredentialProfile): Promise<void> {
   const secret = await keyringRead(profile.server);
   const token = secret.refreshToken ?? secret.accessToken;
+  if (profile.revocationEndpoint === undefined) {
+    await keyringDelete(profile.server);
+    return;
+  }
   let response: Response;
   try {
     response = await fetch(profile.revocationEndpoint, {
@@ -356,13 +368,18 @@ async function discover(server: string): Promise<{ metadata: AuthorizationMetada
   const issuer = validateOAuthUrl(authorizationServers[0], "OAuth issuer").replace(/\/$/u, "");
   const issuerUrl = new URL(issuer);
   if (issuerUrl.search.length > 0) throw new Error("OAuth issuer must not contain a query");
-  const metadataUrl = `${issuerUrl.origin}/.well-known/oauth-authorization-server${issuerUrl.pathname}`;
+  const metadataUrl = `${issuerUrl.origin}/.well-known/oauth-authorization-server${
+    issuerUrl.pathname === "/" ? "" : issuerUrl.pathname
+  }`;
   const metadata = await requestJson(metadataUrl);
   if (
     metadata.issuer !== issuer ||
     typeof metadata.authorization_endpoint !== "string" ||
     typeof metadata.token_endpoint !== "string" ||
-    typeof metadata.revocation_endpoint !== "string"
+    (metadata.revocation_endpoint !== undefined && typeof metadata.revocation_endpoint !== "string") ||
+    (metadata.registration_endpoint !== undefined && typeof metadata.registration_endpoint !== "string") ||
+    (metadata.client_id_metadata_document_supported !== undefined &&
+      typeof metadata.client_id_metadata_document_supported !== "boolean")
   ) {
     throw new Error("Authorization server metadata is incomplete or has an issuer mismatch");
   }
@@ -371,10 +388,61 @@ async function discover(server: string): Promise<{ metadata: AuthorizationMetada
       issuer,
       authorization_endpoint: validateOAuthUrl(metadata.authorization_endpoint, "OAuth authorization endpoint"),
       token_endpoint: validateOAuthUrl(metadata.token_endpoint, "OAuth token endpoint"),
-      revocation_endpoint: validateOAuthUrl(metadata.revocation_endpoint, "OAuth revocation endpoint"),
+      client_id_metadata_document_supported:
+        metadata.client_id_metadata_document_supported === true,
+      ...(metadata.revocation_endpoint === undefined
+        ? {}
+        : {
+          revocation_endpoint: validateOAuthUrl(
+            metadata.revocation_endpoint,
+            "OAuth revocation endpoint",
+          ),
+        }),
+      ...(metadata.registration_endpoint === undefined
+        ? {}
+        : {
+          registration_endpoint: validateOAuthUrl(
+            metadata.registration_endpoint,
+            "OAuth registration endpoint",
+          ),
+        }),
     },
     resource: expectedResource,
   };
+}
+
+async function registerOAuthClient(
+  server: string,
+  metadata: AuthorizationMetadata,
+): Promise<string> {
+  if (metadata.client_id_metadata_document_supported) {
+    return `${server}${CLI_CLIENT_METADATA_PATH}`;
+  }
+  if (metadata.registration_endpoint === undefined) {
+    throw new Error(
+      "Authorization server supports neither Client ID Metadata Documents nor Dynamic Client Registration",
+    );
+  }
+  const registration = await requestJson(metadata.registration_endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      client_name: "schemagrep terminal",
+      redirect_uris: [CLI_REDIRECT_URI],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+      scope: OAUTH_SCOPES.join(" "),
+    }),
+  });
+  if (
+    typeof registration.client_id !== "string" ||
+    registration.client_id.length === 0 ||
+    registration.client_id.length > 2048
+  ) {
+    throw new Error("OAuth dynamic client registration returned an invalid client ID");
+  }
+  return registration.client_id;
 }
 
 function launchBrowser(url: string): void {
@@ -385,49 +453,54 @@ function launchBrowser(url: string): void {
 }
 
 async function receiveAuthorizationCode(expectedState: string): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      server.close();
-      reject(new Error("OAuth login timed out"));
-    }, LOGIN_TIMEOUT_MS);
-    const server = createServer((request, response) => {
-      const url = new URL(request.url ?? "/", CLI_REDIRECT_URI);
-      if (url.pathname !== "/callback") {
-        response.writeHead(404).end("Not found");
-        return;
-      }
-      const error = url.searchParams.get("error");
-      const code = url.searchParams.get("code");
-      if (url.searchParams.get("state") !== expectedState || code === null || error !== null) {
-        response.writeHead(400, { "content-type": "text/plain; charset=utf-8" }).end("Authorization failed. Return to the terminal.");
-        clearTimeout(timer);
-        server.close();
-        reject(new Error(error ?? "OAuth state validation failed"));
-        return;
-      }
-      response.writeHead(200, { "content-type": "text/plain; charset=utf-8" }).end("schemagrep is connected. You may close this tab.");
+  const completion = Promise.withResolvers<string>();
+  const server = createServer((request, response) => {
+    const url = new URL(request.url ?? "/", CLI_REDIRECT_URI);
+    if (url.pathname !== "/callback") {
+      response.writeHead(404).end("Not found");
+      return;
+    }
+    const error = url.searchParams.get("error");
+    const code = url.searchParams.get("code");
+    if (url.searchParams.get("state") !== expectedState || code === null || error !== null) {
+      response.writeHead(400, { "content-type": "text/plain; charset=utf-8" })
+        .end("Authorization failed. Return to the terminal.");
       clearTimeout(timer);
       server.close();
-      resolve(code);
-    });
-    server.once("error", (error) => {
-      clearTimeout(timer);
-      reject(new Error(`Could not open OAuth callback on ${CLI_REDIRECT_URI}: ${error.message}`));
-    });
-    server.listen(47831, "127.0.0.1", () => undefined);
+      completion.reject(new Error(error ?? "OAuth state validation failed"));
+      return;
+    }
+    response.writeHead(200, { "content-type": "text/plain; charset=utf-8" })
+      .end("schemagrep is connected. You may close this tab.");
+    clearTimeout(timer);
+    server.close();
+    completion.resolve(code);
   });
+  const timer = setTimeout(() => {
+    server.close();
+    completion.reject(new Error("OAuth login timed out"));
+  }, LOGIN_TIMEOUT_MS);
+  server.once("error", (error) => {
+    clearTimeout(timer);
+    completion.reject(
+      new Error(`Could not open OAuth callback on ${CLI_REDIRECT_URI}: ${error.message}`),
+    );
+  });
+  server.listen(47831, "127.0.0.1");
+  return completion.promise;
 }
 
 async function login(serverArgument: string, openBrowser: boolean): Promise<string> {
   const server = normalizeServer(serverArgument);
   const { metadata, resource } = await discover(server);
+  const clientId = await registerOAuthClient(server, metadata);
   const verifier = randomBytes(48).toString("base64url");
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   const state = randomBytes(24).toString("base64url");
   const authorizationUrl = new URL(metadata.authorization_endpoint);
   authorizationUrl.search = new URLSearchParams({
     response_type: "code",
-    client_id: CLI_CLIENT_ID,
+    client_id: clientId,
     redirect_uri: CLI_REDIRECT_URI,
     scope: OAUTH_SCOPES.join(" "),
     code_challenge: challenge,
@@ -450,14 +523,20 @@ async function login(serverArgument: string, openBrowser: boolean): Promise<stri
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "authorization_code",
-      client_id: CLI_CLIENT_ID,
+      client_id: clientId,
       redirect_uri: CLI_REDIRECT_URI,
       code,
       code_verifier: verifier,
       resource,
     }),
   });
-  if (typeof token.access_token !== "string" || typeof token.expires_in !== "number") {
+  if (
+    typeof token.access_token !== "string" ||
+    token.access_token.length === 0 ||
+    typeof token.expires_in !== "number" ||
+    !Number.isFinite(token.expires_in) ||
+    token.expires_in <= 0
+  ) {
     throw new Error("Authorization server returned an invalid token response");
   }
   const accessToken = token.access_token;
@@ -471,15 +550,24 @@ async function login(serverArgument: string, openBrowser: boolean): Promise<stri
       // First login has no prior profile.
     }
     if (previousProfile !== undefined && previousProfile.server !== server) {
-      await revokeAndDeleteCredentials(previousProfile);
+      try {
+        await revokeAndDeleteCredentials(previousProfile);
+      } catch {
+        console.error(
+          "Previous server token revocation failed; removing the unreachable local profile.",
+        );
+        await keyringDelete(previousProfile.server);
+      }
     }
     await saveCredentials({
       version: 1,
       server,
       issuer: metadata.issuer,
-      clientId: CLI_CLIENT_ID,
+      clientId,
       tokenEndpoint: metadata.token_endpoint,
-      revocationEndpoint: metadata.revocation_endpoint,
+      ...(metadata.revocation_endpoint === undefined
+        ? {}
+        : { revocationEndpoint: metadata.revocation_endpoint }),
       resource,
       accessToken,
       expiresAt: Date.now() + expiresIn * 1000,

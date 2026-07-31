@@ -1,37 +1,23 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app";
-import { loadConfig, type ServiceConfig } from "../src/config";
+import { loadConfig } from "../src/config";
 import type { FileService, PublicFileRecord, UploadSource } from "../src/files/types";
 import type { StructuredQueryRequest, StructuredQueryResponse } from "../src/query/contract";
+import { testConfig } from "./support/config";
+import { TestManagedOAuthService } from "./support/managed-oauth";
 
 const ALPHA_KEY = "alpha-secret-0123456789abcdef0123456789";
 const BETA_KEY = "beta-secret-0123456789abcdef01234567890";
 const FILE_ID = "file_abcdef0123456789abcdef0123456789";
 
-const CONFIG: ServiceConfig = {
-  host: "127.0.0.1",
-  port: 3000,
-  schemagrepBinary: "schemagrep",
+const CONFIG = testConfig({
   storageBaseDirectory: "/tmp/schemagrep-cloud-access-tests",
-  fileTtlMs: 3_600_000,
-  processTimeoutMs: 30_000,
-  maxUploadBytes: 1024,
-  maxArtifactBytes: 4096,
-  maxSchemaBytes: 4096,
-  maxQueryOutputBytes: 4096,
-  authDisabled: false,
-  apiCredentials: [
-    { tenantId: "alpha", secret: ALPHA_KEY },
-    { tenantId: "beta", secret: BETA_KEY },
-  ],
-  rateLimitMax: 100,
-  rateLimitWindowMs: 60_000,
-  maxTenantStorageBytes: 4096,
-  workerSandbox: "disabled",
-  mcpAllowedHostnames: ["localhost", "127.0.0.1"],
-  bubblewrapBinary: "/usr/bin/bwrap",
-};
+});
+const OAUTH = new TestManagedOAuthService(
+  "http://127.0.0.1:3199",
+  { [ALPHA_KEY]: "alpha", [BETA_KEY]: "beta" },
+);
 
 interface OwnedRecord {
   ownerId: string;
@@ -117,7 +103,7 @@ afterEach(async () => {
 
 describe("API access control", () => {
   test("leaves health public but requires a bearer key for file routes", async () => {
-    app = buildApp({ config: CONFIG, fileService: new TenantFileService() });
+    app = buildApp({ config: CONFIG, fileService: new TenantFileService(), oauthService: OAUTH });
 
     const health = await app.inject({ method: "GET", url: "/health" });
     const missing = await app.inject({ method: "GET", url: `/v1/files/${FILE_ID}` });
@@ -134,13 +120,13 @@ describe("API access control", () => {
 
     expect(health.statusCode).toBe(200);
     expect(missing.statusCode).toBe(401);
-    expect(missing.headers["www-authenticate"]).toBe("Bearer");
+    expect(missing.headers["www-authenticate"]).toContain("resource_metadata=");
     expect(invalid.statusCode).toBe(401);
     expect(lowercaseScheme.statusCode).toBe(404);
   });
 
   test("isolates uploaded files by authenticated tenant", async () => {
-    app = buildApp({ config: CONFIG, fileService: new TenantFileService() });
+    app = buildApp({ config: CONFIG, fileService: new TenantFileService(), oauthService: OAUTH });
     const boundary = "tenant-upload-boundary";
     const payload = Buffer.from(
       `--${boundary}\r\n` +
@@ -211,6 +197,7 @@ describe("API access control", () => {
     app = buildApp({
       config: { ...CONFIG, rateLimitMax: 2 },
       fileService: new TenantFileService(),
+      oauthService: OAUTH,
     });
 
     const alphaStatuses: number[] = [];
@@ -241,6 +228,7 @@ describe("API access control", () => {
         trustedProxyClientIpHeader: "x-real-ip",
       },
       fileService: new TenantFileService(),
+      oauthService: OAUTH,
     });
     const first = await app.inject({
       method: "POST",
@@ -261,22 +249,18 @@ describe("API access control", () => {
   });
 });
 
-describe("API key configuration", () => {
-  test("requires credentials unless authentication is explicitly disabled", () => {
-    expect(() => loadConfig({})).toThrow("SCHEMAGREP_API_KEYS is required");
+describe("managed authentication configuration", () => {
+  test("requires managed identity unless authentication is explicitly disabled", () => {
+    expect(() => loadConfig({})).toThrow("Managed authentication is required");
     expect(loadConfig({ AUTH_DISABLED: "true" }).authDisabled).toBe(true);
+    expect(() => loadConfig({ AUTH_DISABLED: "true", HOST: "0.0.0.0" }))
+      .toThrow("loopback-only");
   });
 
-  test("rejects short and duplicated secrets", () => {
-    expect(() => loadConfig({ SCHEMAGREP_API_KEYS: '{"alpha":"short"}' })).toThrow(
-      "32 to 512 UTF-8 bytes",
+  test("requires every managed identity setting", () => {
+    expect(() => loadConfig({ PUBLIC_BASE_URL: "https://app.example.com" })).toThrow(
+      "WORKOS_API_KEY is required",
     );
-    expect(() =>
-      loadConfig({
-        SCHEMAGREP_API_KEYS:
-          '{"alpha":"same-secret-0123456789abcdef012345","beta":"same-secret-0123456789abcdef012345"}',
-      }),
-    ).toThrow("must use a unique API key");
   });
 
   test("normalizes MCP Host allowlists and rejects URL-shaped entries", () => {
@@ -304,31 +288,24 @@ describe("API key configuration", () => {
       TRUSTED_PROXY_CLIENT_IP_HEADER: "x-forwarded-for: spoofed",
     })).toThrow("valid HTTP header name");
   });
-  test("requires complete and secure OAuth public configuration", () => {
-    expect(() => loadConfig({
-      AUTH_DISABLED: "true",
-      PUBLIC_BASE_URL: "https://beta.example.com",
-    })).toThrow("must be configured together");
-    expect(() => loadConfig({
-      AUTH_DISABLED: "true",
-      PUBLIC_BASE_URL: "http://beta.example.com",
-      OAUTH_COOKIE_KEY: "oauth-cookie-0123456789abcdef0123456789",
-    })).toThrow("must be HTTPS");
-    expect(() => loadConfig({
-      AUTH_DISABLED: "true",
-      PUBLIC_BASE_URL: "https://beta.example.com/nested",
-      OAUTH_COOKIE_KEY: "oauth-cookie-0123456789abcdef0123456789",
-    })).toThrow("must not contain a path");
-    expect(loadConfig({
-      AUTH_DISABLED: "true",
-      PUBLIC_BASE_URL: "https://beta.example.com/",
-      OAUTH_COOKIE_KEY: "oauth-cookie-0123456789abcdef0123456789",
-    }).publicBaseUrl).toBe("https://beta.example.com");
-    expect(loadConfig({
-      AUTH_DISABLED: "true",
-      PUBLIC_BASE_URL: "http://[::1]:3000",
-      OAUTH_COOKIE_KEY: "oauth-cookie-0123456789abcdef0123456789",
-    }).publicBaseUrl).toBe("http://[::1]:3000");
+  test("requires complete and secure WorkOS configuration", () => {
+    const managed = {
+      PUBLIC_BASE_URL: "https://app.example.com",
+      WORKOS_API_KEY: "sk_test_example",
+      WORKOS_CLIENT_ID: "client_example",
+      WORKOS_AUTHKIT_URL: "https://example.authkit.app",
+      WORKOS_COOKIE_PASSWORD: "cookie-password-0123456789abcdef",
+      CSRF_SECRET: "csrf-secret-0123456789abcdef0123",
+    };
+    expect(loadConfig(managed).publicBaseUrl).toBe("https://app.example.com");
+    expect(() => loadConfig({ ...managed, PUBLIC_BASE_URL: "http://app.example.com" }))
+      .toThrow("must be HTTPS");
+    expect(() => loadConfig({ ...managed, WORKOS_AUTHKIT_URL: "http://localhost:3000" }))
+      .toThrow("must be HTTPS");
+    expect(() => loadConfig({ ...managed, WORKOS_COOKIE_PASSWORD: "too-short" }))
+      .toThrow("32 to 512 UTF-8 bytes");
+    expect(loadConfig({ ...managed, PUBLIC_BASE_URL: "http://[::1]:3000" }).publicBaseUrl)
+      .toBe("http://[::1]:3000");
   });
 
 });

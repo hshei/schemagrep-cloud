@@ -1,15 +1,18 @@
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { randomBytes } from "node:crypto";
+import type { IncomingMessage } from "node:http";
 import { isIP } from "node:net";
-import { join } from "node:path";
-import Fastify, { type FastifyInstance } from "fastify";
-import type { AuthInfo } from "@modelcontextprotocol/server";
+import Fastify, {
+  type FastifyInstance,
+  type HookHandlerDoneFunction,
+} from "fastify";
+import cookie from "@fastify/cookie";
+import csrfProtection from "@fastify/csrf-protection";
 import multipart from "@fastify/multipart";
-import middie from "@fastify/middie";
+import type { AuthInfo } from "@modelcontextprotocol/server";
 import { loadConfig, type ServiceConfig } from "./config";
 import { registerFileRoutes } from "./files/routes";
 import { createFileService } from "./files/service";
 import type { FileService } from "./files/types";
-import { ApiKeyAuthenticator } from "./security/auth";
 import { FixedWindowRateLimiter } from "./security/rate-limit";
 import { registerMcpRoutes } from "./mcp/routes";
 import { registerDashboardRoutes } from "./web/routes";
@@ -19,9 +22,20 @@ import {
 } from "./telemetry/product";
 import { registerFeedbackRoutes } from "./feedback/routes";
 import { FeedbackStore } from "./feedback/store";
-import { OAuthService } from "./oauth/provider";
-import { OAUTH_SCOPES } from "./oauth/constants";
+import {
+  SESSION_COOKIE_NAME,
+  WorkOSOAuthService,
+  type AuthenticatedIdentity,
+  type ManagedOAuthService,
+} from "./oauth/provider";
+import {
+  CLI_CLIENT_METADATA_PATH,
+  OAUTH_SCOPES,
+  RESOURCE_PERMISSIONS,
+} from "./oauth/constants";
 import { registerOAuthRoutes } from "./oauth/routes";
+
+const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 
 export interface BuildAppOptions {
   logger?: boolean;
@@ -29,6 +43,7 @@ export interface BuildAppOptions {
   fileService?: FileService;
   productTelemetry?: ProductTelemetry;
   feedbackStore?: FeedbackStore;
+  oauthService?: ManagedOAuthService;
 }
 
 function productAction(method: string, route: string): ProductTelemetryInput["action"] | undefined {
@@ -54,11 +69,6 @@ function bearerToken(authorization: string | undefined): string | undefined {
   return match?.[1];
 }
 
-function requiredScope(method: string, route: string): string {
-  if (method === "POST" && route === "/v1/files") return "files:write";
-  if (method === "DELETE" && route === "/v1/files/:id") return "files:delete";
-  return "files:read";
-}
 function clientAddress(
   request: IncomingMessage,
   trustedProxyClientIpHeader: string | undefined,
@@ -74,6 +84,18 @@ function clientAddress(
   return candidate !== undefined && isIP(candidate) !== 0 ? candidate : remoteAddress;
 }
 
+function localDevelopmentIdentity(): AuthenticatedIdentity {
+  const tenantId = "local-development";
+  return {
+    tenantId,
+    authInfo: {
+      token: "[authentication-disabled]",
+      clientId: tenantId,
+      scopes: [...RESOURCE_PERMISSIONS],
+    },
+    name: "Local development",
+  };
+}
 
 export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   const config = options.config ?? loadConfig();
@@ -92,61 +114,72 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     ?? (config.feedbackPath !== undefined && config.feedbackRetentionMs !== undefined
       ? new FeedbackStore(config.feedbackPath, config.feedbackRetentionMs)
       : undefined);
-  const authenticator = config.authDisabled ? undefined : new ApiKeyAuthenticator(config.apiCredentials);
-  const oauth = !config.authDisabled &&
-    config.publicBaseUrl !== undefined &&
-    config.oauthCookieKey !== undefined
-    ? new OAuthService({
-      publicBaseUrl: config.publicBaseUrl,
-      cookieKey: config.oauthCookieKey,
-      storageDirectory: join(config.storageBaseDirectory, "oauth"),
-    })
-    : undefined;
+
+  let oauth = options.oauthService;
+  if (!config.authDisabled && oauth === undefined) {
+    if (config.publicBaseUrl === undefined || config.workos === undefined) {
+      throw new Error("Managed WorkOS authentication is not configured");
+    }
+    oauth = new WorkOSOAuthService(config.publicBaseUrl, config.workos);
+  }
+
+  const cookieSecret = config.workos?.csrfSecret ?? randomBytes(32).toString("base64url");
+  app.register(cookie, { secret: cookieSecret, hook: "onRequest" });
+  app.register(csrfProtection, {
+    cookieKey: "sg_csrf",
+    cookieOpts: {
+      path: "/",
+      httpOnly: true,
+      sameSite: "strict",
+      secure: oauth?.secureCookies ?? false,
+      signed: true,
+    },
+    getToken: (request) => {
+      const value = request.headers["x-csrf-token"];
+      return Array.isArray(value) ? undefined : value;
+    },
+  });
   const rateLimiter = new FixedWindowRateLimiter(config.rateLimitMax, config.rateLimitWindowMs);
   const oauthRateLimiter = new FixedWindowRateLimiter(config.rateLimitMax, config.rateLimitWindowMs);
   const publicRoutes = new Set([
     "/",
     "/health",
+    "/ready",
+    "/login",
+    "/callback",
+    "/logout",
+    "/csrf-token",
+    "/v1/session",
     "/assets/dashboard.css",
     "/assets/dashboard.js",
     "/assets/manrope-latin-wght-normal.woff2",
     "/.well-known/oauth-protected-resource",
     "/.well-known/oauth-protected-resource/mcp",
-    "/.well-known/oauth-authorization-server/oauth",
+    "/.well-known/oauth-authorization-server",
+    CLI_CLIENT_METADATA_PATH,
   ]);
   app.decorateRequest("tenantId", "");
   app.decorateRequest("authInfo", null);
+  app.decorateRequest("authMethod", null);
+  app.decorateRequest("userEmail", "");
+  app.decorateRequest("userName", "");
 
   app.register(registerDashboardRoutes);
-  if (oauth !== undefined && authenticator !== undefined) {
-    app.register(middie);
-    app.after(() => {
-      const providerHandler = oauth.provider.callback();
-      app.use("/oauth", (request: IncomingMessage, response: ServerResponse) => {
-        const requestAddress = clientAddress(request, config.trustedProxyClientIpHeader);
-        const decision = oauthRateLimiter.consume(`oauth:${requestAddress}`);
-        const resetSeconds = Math.max(1, Math.ceil((decision.resetAt - Date.now()) / 1000));
-        response.setHeader("ratelimit-limit", decision.limit);
-        response.setHeader("ratelimit-remaining", decision.remaining);
-        response.setHeader("ratelimit-reset", resetSeconds);
-        if (!decision.allowed) {
-          response.statusCode = 429;
-          response.setHeader("content-type", "application/json; charset=utf-8");
-          response.setHeader("retry-after", resetSeconds);
-          response.end(JSON.stringify({
-            error: { code: "rate_limit_exceeded", message: "OAuth request limit exceeded" },
-          }));
-          return;
-        }
-        providerHandler(request, response);
-      });
-    });
-    app.register(registerOAuthRoutes, { oauth, inviteAuthenticator: authenticator });
-  }
+  if (oauth !== undefined) app.register(registerOAuthRoutes, { oauth });
+
   app.get("/health", async () => ({
     service: "schemagrep-cloud",
     status: "ok",
   }));
+  app.get("/ready", async (_request, reply) => {
+    try {
+      await fileService.ready?.();
+      return { service: "schemagrep-cloud", status: "ready" };
+    } catch (error) {
+      app.log.error({ err: error }, "Readiness check failed");
+      return reply.code(503).send({ service: "schemagrep-cloud", status: "unavailable" });
+    }
+  });
 
   app.register(multipart, {
     limits: {
@@ -157,17 +190,56 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     },
     throwFileSizeLimit: true,
   });
+
   app.addHook("onRequest", async (request, reply) => {
     const route = request.routeOptions.url ?? "";
     const requestPath = request.url.split("?", 1)[0] ?? "";
-    const publicRequest =
-      publicRoutes.has(route) ||
-      requestPath.startsWith("/oauth/") ||
-      requestPath.startsWith("/oauth-login/");
+    let authenticated: AuthenticatedIdentity | undefined;
+    let authMethod: "disabled" | "bearer" | "session" | undefined;
+
+    if (config.authDisabled) {
+      authenticated = localDevelopmentIdentity();
+      authMethod = "disabled";
+    } else if (oauth !== undefined) {
+      const token = bearerToken(request.headers.authorization);
+      if (token !== undefined) {
+        authenticated = await oauth.authenticateBearer(token);
+        if (authenticated !== undefined) authMethod = "bearer";
+      }
+      if (authenticated === undefined) {
+        const sealedSession = request.cookies[SESSION_COOKIE_NAME];
+        if (sealedSession !== undefined) {
+          const browser = await oauth.authenticateBrowserSession(sealedSession);
+          if (browser !== undefined) {
+            authenticated = browser.identity;
+            authMethod = "session";
+            if (browser.sealedSession !== undefined) {
+              reply.setCookie(SESSION_COOKIE_NAME, browser.sealedSession, {
+                path: "/",
+                httpOnly: true,
+                sameSite: "lax",
+                secure: oauth.secureCookies,
+                maxAge: SESSION_TTL_SECONDS,
+              });
+            }
+          }
+        }
+      }
+    }
+
+    if (authenticated !== undefined && authMethod !== undefined) {
+      request.tenantId = authenticated.tenantId;
+      request.authInfo = authenticated.authInfo;
+      request.authMethod = authMethod;
+      request.userEmail = authenticated.email ?? "";
+      request.userName = authenticated.name ?? "";
+    }
+
+    const publicRequest = publicRoutes.has(route);
     if (publicRequest) {
-      if (requestPath.startsWith("/oauth-login/")) {
+      if (["/login", "/callback"].includes(requestPath)) {
         const decision = oauthRateLimiter.consume(
-          `interaction:${clientAddress(request.raw, config.trustedProxyClientIpHeader)}`,
+          `oauth:${clientAddress(request.raw, config.trustedProxyClientIpHeader)}`,
         );
         const resetSeconds = Math.max(1, Math.ceil((decision.resetAt - Date.now()) / 1000));
         reply.headers({
@@ -179,39 +251,15 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           await reply
             .header("retry-after", resetSeconds)
             .code(429)
-            .send({ error: { code: "rate_limit_exceeded", message: "OAuth interaction limit exceeded" } });
+            .send({ error: { code: "rate_limit_exceeded", message: "Authentication request limit exceeded" } });
           return reply;
         }
       }
       return;
     }
 
-    let tenantId: string | undefined;
-    let authInfo: AuthInfo | undefined;
-    if (config.authDisabled) {
-      tenantId = "local-development";
-      authInfo = {
-        token: "[authentication-disabled]",
-        clientId: tenantId,
-        scopes: [...OAUTH_SCOPES],
-      };
-    } else {
-      tenantId = authenticator?.authenticate(request.headers.authorization);
-      if (tenantId !== undefined) {
-        authInfo = {
-          token: "[validated-and-redacted]",
-          clientId: tenantId,
-          scopes: [...OAUTH_SCOPES],
-        };
-      } else {
-        const token = bearerToken(request.headers.authorization);
-        if (token !== undefined) authInfo = await oauth?.verifyAccessToken(token);
-        tenantId = authInfo?.clientId;
-      }
-    }
-
     const decision = rateLimiter.consume(
-      tenantId ??
+      authenticated?.tenantId ??
         `unauthenticated:${clientAddress(request.raw, config.trustedProxyClientIpHeader)}`,
     );
     const resetSeconds = Math.max(1, Math.ceil((decision.resetAt - Date.now()) / 1000));
@@ -220,7 +268,6 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
       "ratelimit-remaining": decision.remaining,
       "ratelimit-reset": resetSeconds,
     });
-
     if (!decision.allowed) {
       await reply
         .header("retry-after", resetSeconds)
@@ -228,29 +275,30 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
         .send({ error: { code: "rate_limit_exceeded", message: "Request limit exceeded" } });
       return reply;
     }
-    if (tenantId === undefined || authInfo === undefined) {
+    if (authenticated === undefined) {
       const challenge = oauth === undefined
         ? "Bearer"
-        : `Bearer resource_metadata="${oauth.resourceMetadataUrl}", scope="${requiredScope(request.method, route)}"`;
+        : `Bearer resource_metadata="${oauth.resourceMetadataUrl}", scope="${OAUTH_SCOPES.join(" ")}"`;
       await reply
         .header("www-authenticate", challenge)
         .code(401)
-        .send({ error: { code: "unauthorized", message: "A valid bearer credential is required" } });
+        .send({ error: { code: "unauthorized", message: "A valid managed identity is required" } });
       return reply;
     }
-
-    const scope = requiredScope(request.method, route);
-    if (!authInfo.scopes.includes(scope)) {
-      await reply
-        .header("www-authenticate", `Bearer error="insufficient_scope", scope="${scope}"`)
-        .code(403)
-        .send({ error: { code: "insufficient_scope", message: `The ${scope} scope is required` } });
-      return reply;
-    }
-    request.tenantId = tenantId;
-    request.authInfo = authInfo;
-    return;
   });
+
+  app.addHook(
+    "preHandler",
+    (request, reply, done: HookHandlerDoneFunction) => {
+      const unsafeMethod = !["GET", "HEAD", "OPTIONS"].includes(request.method);
+      if (request.authMethod !== "session" || !unsafeMethod) {
+        done();
+        return;
+      }
+      app.csrfProtection(request, reply, done);
+    },
+  );
+
   app.addHook("onResponse", (request, reply, done) => {
     const action = productAction(request.method, request.routeOptions.url ?? "");
     if (action !== undefined && request.tenantId.length > 0) {
@@ -264,9 +312,15 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
     }
     done();
   });
-  app.get("/v1/session", async (_request, reply) => reply
+
+  app.get("/v1/session", async (request, reply) => reply
     .header("cache-control", "no-store")
-    .send({ authenticated: true, oauth: oauth !== undefined }));
+    .send({
+      authenticated: request.authInfo !== null,
+      oauth: oauth !== undefined,
+      ...(request.userEmail.length === 0 ? {} : { email: request.userEmail }),
+      ...(request.userName.length === 0 ? {} : { name: request.userName }),
+    }));
   app.get("/v1/usage", async (request, reply) => {
     const [storage, activity] = await Promise.all([
       fileService.usage(request.tenantId),
@@ -284,7 +338,6 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   app.register(registerFeedbackRoutes, {
     ...(feedbackStore === undefined ? {} : { feedbackStore }),
   });
-
   app.register(registerFileRoutes, { fileService });
   app.register(registerMcpRoutes, {
     fileService,

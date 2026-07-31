@@ -1,0 +1,31 @@
+{
+	email operator@example.com
+	servers {
+		trusted_proxies static private_ranges
+		client_ip_headers X-Forwarded-For X-Real-IP
+		trusted_proxies_strict
+	}
+}
+
+schemagrep.example.com {
+	encode zstd gzip
+
+	request_body {
+		max_size 27MiB
+	}
+
+	reverse_proxy 127.0.0.1:3000 {
+		header_up X-Schemagrep-Client-IP {client_ip}
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 70s
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	# Access logs are intentionally disabled: request paths can contain file IDs.
+}

@@ -1,14 +1,17 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { FastifyInstance } from "fastify";
 import { buildApp } from "../src/app";
-import type { ServiceConfig } from "../src/config";
 import {
   EmptyUploadError,
   TenantStorageQuotaError,
+  SchemagrepProcessError,
+  ServiceStorageCapacityError,
+  TenantFileLimitError,
   UploadTooLargeError,
 } from "../src/files/errors";
 import type { FileService, PublicFileRecord, UploadSource } from "../src/files/types";
 import type { StructuredQueryRequest, StructuredQueryResponse } from "../src/query/contract";
+import { testConfig } from "./support/config";
 
 const RECORD: PublicFileRecord = {
   id: "file_0123456789abcdef0123456789abcdef",
@@ -21,26 +24,10 @@ const RECORD: PublicFileRecord = {
   expiresAt: "2026-07-29T01:00:00.000Z",
 };
 
-const CONFIG: ServiceConfig = {
-  host: "127.0.0.1",
-  port: 3000,
-  schemagrepBinary: "schemagrep",
-  storageBaseDirectory: "/tmp/schemagrep-cloud-tests",
-  fileTtlMs: 3_600_000,
-  processTimeoutMs: 30_000,
-  maxUploadBytes: 1024,
-  maxArtifactBytes: 4096,
-  maxSchemaBytes: 4096,
-  maxQueryOutputBytes: 4096,
+const CONFIG = testConfig({
   authDisabled: true,
-  apiCredentials: [],
-  rateLimitMax: 100,
-  rateLimitWindowMs: 60_000,
-  maxTenantStorageBytes: 4096,
-  workerSandbox: "disabled",
-  mcpAllowedHostnames: ["localhost", "127.0.0.1"],
-  bubblewrapBinary: "/usr/bin/bwrap",
-};
+  storageBaseDirectory: "/tmp/schemagrep-cloud-tests",
+});
 
 class FakeFileService implements FileService {
   uploaded: Buffer | undefined;
@@ -203,6 +190,46 @@ describe("ephemeral file routes", () => {
         message: "Tenant retained-storage quota exceeded",
       },
     });
+  });
+
+  test("returns retry guidance when upload capacity is saturated", async () => {
+    const cases = [
+      {
+        error: new TenantFileLimitError(),
+        status: 429,
+        retryAfter: "60",
+        code: "active_file_limit_exceeded",
+      },
+      {
+        error: new ServiceStorageCapacityError(),
+        status: 503,
+        retryAfter: "60",
+        code: "storage_capacity_unavailable",
+      },
+      {
+        error: new SchemagrepProcessError("busy", "saturated"),
+        status: 503,
+        retryAfter: "1",
+        code: "processor_busy",
+      },
+    ];
+    for (const testCase of cases) {
+      const fileService = new FakeFileService();
+      fileService.ingestError = testCase.error;
+      app = buildApp({ config: CONFIG, fileService });
+      const upload = multipartPayload("events.jsonl", '{"id":1}\n');
+      const response = await app.inject({
+        method: "POST",
+        url: "/v1/files",
+        headers: { "content-type": `multipart/form-data; boundary=${upload.boundary}` },
+        payload: upload.payload,
+      });
+      expect(response.statusCode).toBe(testCase.status);
+      expect(response.headers["retry-after"]).toBe(testCase.retryAfter);
+      expect(response.json()).toMatchObject({ error: { code: testCase.code } });
+      await app.close();
+      app = undefined;
+    }
   });
 
   test("executes validated structured queries and rejects unknown fields", async () => {

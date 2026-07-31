@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Upload a data file and query it through schemagrep's hosted MCP service.">
-  <title>schemagrep private beta</title>
-  <link rel="stylesheet" href="/assets/dashboard.css?v=2">
-  <script src="/assets/dashboard.js?v=2" defer></script>
+  <title>schemagrep workspace</title>
+  <link rel="stylesheet" href="/assets/dashboard.css?v=3">
+  <script src="/assets/dashboard.js?v=3" defer></script>
 </head>
 <body>
   <header class="site-header">
@@ -14,7 +14,7 @@
       <span class="brand-mark" aria-hidden="true">sg</span>
       <span>schemagrep</span>
     </a>
-    <span class="beta-badge">Private beta</span>
+    <span class="beta-badge">Managed workspace</span>
   </header>
 
   <main>
@@ -31,18 +31,14 @@
 
     <section id="access-panel" class="panel access-panel" aria-labelledby="access-title">
       <div>
-        <p class="step-label">Invite access</p>
-        <h2 id="access-title">Unlock your workspace</h2>
-        <p>Paste the beta key from your invitation. It stays in this tab's memory and is never saved by the dashboard.</p>
+        <p class="step-label">Account access</p>
+        <h2 id="access-title">Sign in to your workspace</h2>
+        <p>Use your schemagrep account. Your browser session is encrypted, HTTP-only, and scoped to this service.</p>
       </div>
-      <form id="access-form" class="access-form">
-        <label for="api-key">Beta API key</label>
-        <div class="input-action">
-          <input id="api-key" name="api-key" type="password" autocomplete="off" spellcheck="false" required placeholder="sg_beta_…">
-          <button id="access-submit" class="button primary" type="submit">Unlock</button>
-        </div>
+      <div class="access-form">
+        <a id="access-submit" class="button primary" href="/login">Sign in</a>
         <p id="access-status" class="status" role="status" aria-live="polite"></p>
-      </form>
+      </div>
     </section>
 
     <section id="workspace" class="workspace" aria-label="Dataset workspace" hidden>
@@ -50,8 +46,9 @@
         <div>
           <p class="step-label">Workspace</p>
           <h2>Your ephemeral datasets</h2>
+          <p id="account-name" class="status"></p>
         </div>
-        <button id="forget-key" class="button quiet" type="button">Forget key</button>
+        <button id="sign-out" class="button quiet" type="button">Sign out</button>
       </div>
 
       <div class="workspace-grid">
@@ -74,7 +71,7 @@
         <section class="panel setup-panel" aria-labelledby="setup-title">
           <p class="step-label">Step 2</p>
           <h3 id="setup-title">Connect your AI client</h3>
-          <p>Your client will open browser authorization automatically. Do not paste your beta key into model settings.</p>
+          <p>Your client will open browser authorization automatically. Do not paste account or model-provider secrets into client settings.</p>
           <div class="endpoint-box">
             <span>MCP endpoint</span>
             <code id="mcp-endpoint"></code>
@@ -87,7 +84,7 @@
         <div class="dataset-heading">
           <div>
             <p class="step-label">Workspace usage</p>
-            <h3 id="usage-title">What this beta has processed</h3>
+            <h3 id="usage-title">What this workspace has processed</h3>
           </div>
           <span id="usage-storage" class="codec-badge">Loading</span>
         </div>
@@ -175,7 +172,7 @@
           <div class="feedback-actions">
             <label class="consent-row" for="feedback-consent">
               <input id="feedback-consent" name="consent" type="checkbox" required>
-              <span>I consent to storing this text for up to 30 days to improve the beta.</span>
+              <span>I consent to storing this text for up to 30 days to improve schemagrep.</span>
             </label>
             <button id="feedback-submit" class="button primary" type="submit">Send feedback</button>
           </div>
@@ -186,7 +183,7 @@
   </main>
 
   <footer>
-    <p>Files are processed for this beta only. No model-provider credentials are sent to schemagrep.</p>
+    <p>Files are processed only for this workspace. No model-provider credentials are sent to schemagrep.</p>
   </footer>
 </body>
 </html>

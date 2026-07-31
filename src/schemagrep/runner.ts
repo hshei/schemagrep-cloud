@@ -71,10 +71,53 @@ export interface SchemagrepRunnerOptions {
   maxSchemaBytes: number;
   maxQueryOutputBytes: number;
   sandbox: WorkerSandbox;
+  maxActiveWorkers: number;
+  maxQueuedWorkers: number;
+}
+
+class WorkerCapacity {
+  private active = 0;
+  private readonly queued: Array<(release: () => void) => void> = [];
+
+  constructor(
+    private readonly maxActive: number,
+    private readonly maxQueued: number,
+  ) {}
+
+  acquire(): Promise<() => void> {
+    if (this.active < this.maxActive) {
+      this.active += 1;
+      return Promise.resolve(this.releaseHandle());
+    }
+    if (this.queued.length >= this.maxQueued) {
+      throw new SchemagrepProcessError("busy", "schemagrep worker capacity is saturated");
+    }
+    const { promise, resolve } = Promise.withResolvers<() => void>();
+    this.queued.push(resolve);
+    return promise;
+  }
+
+  private releaseHandle(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.queued.shift();
+      if (next === undefined) {
+        this.active -= 1;
+        return;
+      }
+      next(this.releaseHandle());
+    };
+  }
 }
 
 export class SchemagrepRunner implements SchemagrepProcessor {
-  constructor(private readonly options: SchemagrepRunnerOptions) {}
+  private readonly capacity: WorkerCapacity;
+
+  constructor(private readonly options: SchemagrepRunnerOptions) {
+    this.capacity = new WorkerCapacity(options.maxActiveWorkers, options.maxQueuedWorkers);
+  }
 
   encode(sourcePath: string, outputPath: string): Promise<number> {
     return this.runToFile("encode", sourcePath, outputPath, this.options.maxArtifactBytes);
@@ -168,6 +211,19 @@ export class SchemagrepRunner implements SchemagrepProcessor {
     maxBytes: number,
     destination: Writable,
   ): Promise<number> {
+    const release = await this.capacity.acquire();
+    try {
+      return await this.executeInvocation(invocation, maxBytes, destination);
+    } finally {
+      release();
+    }
+  }
+
+  private async executeInvocation(
+    invocation: ProcessInvocation,
+    maxBytes: number,
+    destination: Writable,
+  ): Promise<number> {
     const child = spawn(invocation.executable, invocation.args, {
       cwd: undefined,
       env: {
@@ -190,10 +246,13 @@ export class SchemagrepRunner implements SchemagrepProcessor {
       stderr = Buffer.concat([stderr, buffer.subarray(0, MAX_STDERR_BYTES - stderr.byteLength)]);
     });
 
-    const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", (code, signal) => resolve({ code, signal }));
-    });
+    const exitResult = Promise.withResolvers<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>();
+    child.once("error", exitResult.reject);
+    child.once("close", (code, signal) => exitResult.resolve({ code, signal }));
+    const exit = exitResult.promise;
 
     const output = pipeline(child.stdout, limiter, destination);
     output.catch(() => child.kill("SIGKILL"));

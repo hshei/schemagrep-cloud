@@ -17,6 +17,17 @@ async function runCli(...args: string[]): Promise<{ exitCode: number; stdout: st
   return { exitCode, stdout, stderr };
 }
 
+async function readLine(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const decoder = new TextDecoder();
+  let output = "";
+  for await (const chunk of stream) {
+    output += decoder.decode(chunk, { stream: true });
+    const newline = output.indexOf("\n");
+    if (newline >= 0) return output.slice(0, newline);
+  }
+  return output + decoder.decode();
+}
+
 describe("cloud CLI guidance", () => {
   test("prints top-level help without requiring credentials", async () => {
     const result = await runCli("--help");
@@ -52,5 +63,74 @@ describe("cloud CLI guidance", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toBe("");
     expect(result.stderr).toContain("Unknown arguments: --bogus");
+  });
+
+  test("discovers Client ID Metadata Document login without a hard-coded client ID", async () => {
+    const requestedPaths: string[] = [];
+    let origin = "";
+    const authorizationServer = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const path = new URL(request.url).pathname;
+        requestedPaths.push(path);
+        if (path === "/.well-known/oauth-protected-resource/mcp") {
+          return Response.json({
+            resource: `${origin}/mcp`,
+            authorization_servers: [origin],
+          });
+        }
+        if (path.replace(/\/$/u, "") === "/.well-known/oauth-authorization-server") {
+          return Response.json({
+            issuer: origin,
+            authorization_endpoint: `${origin}/authorize`,
+            token_endpoint: `${origin}/token`,
+            client_id_metadata_document_supported: true,
+          });
+        }
+        if (path === "/token") return Response.json({});
+        return new Response("Not found", { status: 404 });
+      },
+    });
+    origin = `http://127.0.0.1:${authorizationServer.port}`;
+    const child = Bun.spawn([
+      process.execPath,
+      "src/cli.ts",
+      "login",
+      "--server",
+      origin,
+      "--no-browser",
+    ], {
+      cwd: projectRoot,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const authorizationLine = await readLine(child.stdout);
+      if (authorizationLine.length === 0) {
+        throw new Error(`${await new Response(child.stderr).text()} (${requestedPaths.join(", ")})`);
+      }
+      const authorizationUrl = new URL(authorizationLine);
+      expect(authorizationUrl.origin).toBe(origin);
+      expect(authorizationUrl.pathname).toBe("/authorize");
+      expect(authorizationUrl.searchParams.get("client_id"))
+        .toBe(`${origin}/oauth/client/schemagrep-cli`);
+      expect(authorizationUrl.searchParams.get("resource")).toBe(`${origin}/mcp`);
+      expect(authorizationUrl.searchParams.get("code_challenge_method")).toBe("S256");
+
+      const state = authorizationUrl.searchParams.get("state");
+      const callback = await fetch(
+        `http://127.0.0.1:47831/callback?code=test-code&state=${encodeURIComponent(state as string)}`,
+      );
+      expect(callback.status).toBe(200);
+      const [stderr, exitCode] = await Promise.all([
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain("Authorization server returned an invalid token response");
+    } finally {
+      child.kill();
+      authorizationServer.stop(true);
+    }
   });
 });

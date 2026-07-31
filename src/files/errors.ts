@@ -26,6 +26,20 @@ export class TenantStorageQuotaError extends Error {
   }
 }
 
+export class TenantFileLimitError extends Error {
+  constructor() {
+    super("Tenant active-file limit exceeded");
+    this.name = "TenantFileLimitError";
+  }
+}
+
+export class ServiceStorageCapacityError extends Error {
+  constructor() {
+    super("Service storage capacity is unavailable");
+    this.name = "ServiceStorageCapacityError";
+  }
+}
+
 export class UnsupportedFileTypeError extends Error {
   constructor(filename: string) {
     super(`Unsupported file type for ${filename}`);
@@ -40,7 +54,7 @@ export class UploadTooLargeError extends Error {
   }
 }
 
-export type ProcessFailureKind = "exit" | "output_limit" | "spawn" | "timeout";
+export type ProcessFailureKind = "busy" | "exit" | "output_limit" | "spawn" | "timeout";
 
 export class SchemagrepProcessError extends Error {
   constructor(
