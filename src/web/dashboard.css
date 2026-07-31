@@ -159,12 +159,18 @@ h3 { margin-bottom: 10px; font-size: 24px; }
 
 .access-panel {
   display: grid;
-  grid-template-columns: minmax(0, .9fr) minmax(320px, 1.1fr);
+  grid-template-columns: minmax(0, 600px) minmax(200px, 240px);
+  justify-content: space-between;
   gap: 48px;
   align-items: center;
   padding: 38px;
 }
-.access-form .button { min-width: 128px; }
+.access-form {
+  width: 100%;
+  justify-self: end;
+}
+.access-form .button { width: 100%; }
+.access-form .status { text-align: center; }
 
 
 .access-panel p,
