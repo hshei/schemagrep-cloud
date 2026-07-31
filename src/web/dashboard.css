@@ -164,6 +164,8 @@ h3 { margin-bottom: 10px; font-size: 24px; }
   align-items: center;
   padding: 38px;
 }
+.access-form .button { min-width: 128px; }
+
 
 .access-panel p,
 .upload-panel > p,
@@ -215,12 +217,28 @@ textarea:focus,
 }
 
 .button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-height: 44px;
   border: 1px solid transparent;
   border-radius: 10px;
   padding: 0 17px;
+  color: inherit;
   font-weight: 760;
+  line-height: 1;
+  text-decoration: none;
+  cursor: pointer;
   transition: transform .14s ease, border-color .14s ease, background .14s ease;
+}
+.button:focus-visible {
+  outline: 3px solid rgba(124, 242, 189, .24);
+  outline-offset: 3px;
+}
+.button[aria-disabled="true"] {
+  pointer-events: none;
+  cursor: wait;
+  opacity: .58;
 }
 .button:hover:not(:disabled) { transform: translateY(-1px); }
 .button:active:not(:disabled) { transform: translateY(0); }
