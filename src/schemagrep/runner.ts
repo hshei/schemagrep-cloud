@@ -52,6 +52,7 @@ class BufferCollector extends Writable {
 export interface SchemagrepProcessor {
   encode(sourcePath: string, outputPath: string): Promise<number>;
   schema(artifactPath: string, outputPath: string): Promise<number>;
+  primer(primerId: string): Promise<string>;
   query(artifactPath: string, args: readonly string[]): Promise<string>;
 }
 
@@ -129,9 +130,19 @@ export class SchemagrepRunner implements SchemagrepProcessor {
       artifactPath,
       outputPath,
       this.options.maxSchemaBytes,
-      ["--encoded"],
+      ["--encoded", "--compact"],
     );
   }
+  async primer(primerId: string): Promise<string> {
+    const output = new BufferCollector();
+    await this.runInvocation(
+      this.buildInvocation("primer", primerId),
+      this.options.maxSchemaBytes,
+      output,
+    );
+    return output.toString();
+  }
+
 
   async query(artifactPath: string, args: readonly string[]): Promise<string> {
     const output = new BufferCollector();
@@ -144,29 +155,29 @@ export class SchemagrepRunner implements SchemagrepProcessor {
   }
 
   private buildInvocation(
-    action: "encode" | "schema" | "query",
-    inputPath: string,
+    action: "encode" | "schema" | "query" | "primer",
+    input: string,
     extraArgs: readonly string[] = [],
   ): ProcessInvocation {
     if (this.options.sandbox.mode === "disabled") {
-      return { executable: this.options.binaryPath, args: [action, inputPath, ...extraArgs] };
+      return { executable: this.options.binaryPath, args: [action, input, ...extraArgs] };
     }
 
-    const sandboxInput = `/input/data${extname(inputPath)}`;
+    const sandboxInput = `/input/data${extname(input)}`;
     const args = [
       ...bubblewrapIsolationArgs(),
       "--dir",
       "/engine",
       "--dir",
       "/input",
-    ];
-    args.push(
       "--ro-bind",
       this.options.binaryPath,
       "/engine/schemagrep",
-      "--ro-bind",
-      inputPath,
-      sandboxInput,
+    ];
+    if (action !== "primer") {
+      args.push("--ro-bind", input, sandboxInput);
+    }
+    args.push(
       "--tmpfs",
       "/tmp",
       "--dir",
@@ -186,7 +197,7 @@ export class SchemagrepRunner implements SchemagrepProcessor {
       "--",
       "/engine/schemagrep",
       action,
-      sandboxInput,
+      action === "primer" ? input : sandboxInput,
       ...extraArgs,
     );
     return { executable: this.options.sandbox.bubblewrapBinary, args };

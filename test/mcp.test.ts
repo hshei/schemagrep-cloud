@@ -17,8 +17,17 @@ const RECORD: PublicFileRecord = {
   originalName: "events.jsonl",
   sourceBytes: 9,
   schemaBytes: 9,
+  primerId: "schemagrep-manifest/v1",
+  schemaId: `sha256:${"0".repeat(64)}`,
   createdAt: "2026-07-29T00:00:00.000Z",
   expiresAt: "2026-07-29T01:00:00.000Z",
+};
+const SCHEMA = {
+  format: "schemagrep-manifest/v1",
+  primerId: "schemagrep-manifest/v1",
+  codec: "jsonl",
+  records: 1,
+  fields: [],
 };
 const CONFIG = testConfig({
   storageBaseDirectory: "/tmp/schemagrep-cloud-mcp-tests",
@@ -50,8 +59,12 @@ class McpFileService implements FileService {
     return id === FILE_ID && ownerId === "alpha" ? RECORD : undefined;
   }
 
+  async readPrimer(primerId: string): Promise<string> {
+    return `primer:${primerId}`;
+  }
+
   async readSchema(id: string, ownerId: string): Promise<string | undefined> {
-    return id === FILE_ID && ownerId === "alpha" ? "[schema]\n" : undefined;
+    return id === FILE_ID && ownerId === "alpha" ? JSON.stringify(SCHEMA) : undefined;
   }
 
   async query(
@@ -59,6 +72,9 @@ class McpFileService implements FileService {
     ownerId: string,
     query: StructuredQueryRequest,
   ): Promise<StructuredQueryResponse | undefined> {
+    if (query.target !== null && "path" in query.target && query.target.path === "/failure") {
+      throw new Error("simulated query failure");
+    }
     return id === FILE_ID && ownerId === "alpha"
       ? { query, answer: "5", outputBytes: 1 }
       : undefined;
@@ -107,38 +123,65 @@ describe("schemagrep MCP endpoint", () => {
       name: "schemagrep_list_files",
       arguments: {},
     });
+    const primer = await alpha.callTool({
+      name: "schemagrep_get_primer",
+      arguments: { primerId: "schemagrep-manifest/v1" },
+    });
     const schema = await alpha.callTool({
       name: "schemagrep_get_schema",
       arguments: { fileId: FILE_ID },
     });
-    const count = await alpha.callTool({
-      name: "schemagrep_query",
-      arguments: {
-        fileId: FILE_ID,
-        mode: "count",
-        target: { key: "type" },
-        filters: [],
-        value: "push",
-      },
+    const unchangedSchema = await alpha.callTool({
+      name: "schemagrep_get_schema",
+      arguments: { fileId: FILE_ID, knownSchemaId: RECORD.schemaId },
     });
-    const numericCount = await alpha.callTool({
+    const batch = await alpha.callTool({
       name: "schemagrep_query",
       arguments: {
         fileId: FILE_ID,
-        mode: "count",
-        target: { key: "status" },
-        filters: [],
-        value: 404,
+        queries: [
+          {
+            name: "push_count",
+            request: {
+              mode: "count",
+              target: { path: "/type" },
+              filters: [],
+              value: "push",
+            },
+          },
+          {
+            name: "failed_metric",
+            request: {
+              mode: "argmax",
+              target: { path: "/failure" },
+              filters: [],
+            },
+          },
+          {
+            name: "status_count",
+            request: {
+              mode: "count",
+              target: { path: "/status" },
+              filters: [],
+              value: 404,
+            },
+          },
+        ],
       },
     });
     const malformedProjection = await alpha.callTool({
       name: "schemagrep_query",
       arguments: {
         fileId: FILE_ID,
-        mode: "grep",
-        target: { key: "status" },
-        filters: [{ field: { key: "status" }, op: "ge", value: 400 }],
-        limit: 3,
+        queries: [{
+          name: "malformed_projection",
+          request: {
+            mode: "grep",
+            target: { path: "/status" },
+            filters: [{ field: { path: "/status" }, op: "ge", value: 400 }],
+            limit: 3,
+          },
+        }],
       },
     });
 
@@ -150,32 +193,91 @@ describe("schemagrep MCP endpoint", () => {
 
     expect(tools.tools.map((tool) => tool.name)).toEqual([
       "schemagrep_list_files",
+      "schemagrep_get_primer",
       "schemagrep_get_schema",
       "schemagrep_query",
     ]);
     expect(tools.tools.every((tool) => tool.annotations?.readOnlyHint === true)).toBe(true);
-    expect(tools.tools.find((tool) => tool.name === "schemagrep_get_schema")?.description).toContain("exactly once");
-    expect(tools.tools.find((tool) => tool.name === "schemagrep_query")?.description).toContain("target MUST be null");
-    expect(tools.tools.find((tool) => tool.name === "schemagrep_query")?.description).toContain(
-      "use key size, not payload.size",
+    expect(tools.tools.find((tool) => tool.name === "schemagrep_get_schema")?.description).toContain(
+      "knownSchemaId",
     );
+    expect(tools.tools.find((tool) => tool.name === "schemagrep_get_primer")?.description).toContain(
+      "primerId",
+    );
+    expect(tools.tools.find((tool) => tool.name === "schemagrep_query")?.description).toContain(
+      "1-20 named deterministic queries in one call",
+    );
+    expect(tools.tools.find((tool) => tool.name === "schemagrep_query")?.description).toContain(
+      "/payload/size",
+    );
+    expect(tools.tools.find((tool) => tool.name === "schemagrep_query")?.description).toContain(
+      "/columns/N",
+    );
+    expect(tools.tools.find((tool) => tool.name === "schemagrep_query")?.description).toContain(
+      "/fields/N",
+    );
+    const queryInputSchema = JSON.stringify(
+      tools.tools.find((tool) => tool.name === "schemagrep_query")?.inputSchema,
+    );
+    expect(queryInputSchema).toContain('"path"');
+    expect(queryInputSchema).not.toContain('"col"');
+    expect(queryInputSchema).not.toContain('"slot"');
+    expect(queryInputSchema).not.toContain('"key"');
     expect(listing.structuredContent).toEqual({ files: [RECORD] });
-    expect(schema.structuredContent).toEqual({ fileId: FILE_ID, schema: "[schema]\n" });
-    expect(count.structuredContent).toEqual({
+    expect(schema.structuredContent).toEqual({
       fileId: FILE_ID,
-      result: {
-        query: {
-          mode: "count",
-          target: { key: "type" },
-          filters: [],
-          value: "push",
-        },
-        answer: "5",
-        outputBytes: 1,
-      },
+      primerId: RECORD.primerId,
+      schemaId: RECORD.schemaId,
+      unchanged: false,
+      schema: SCHEMA,
     });
-    expect(numericCount.structuredContent).toMatchObject({
-      result: { query: { value: 404 } },
+    expect(unchangedSchema.structuredContent).toEqual({
+      fileId: FILE_ID,
+      primerId: RECORD.primerId,
+      schemaId: RECORD.schemaId,
+      unchanged: true,
+    });
+    expect(primer.structuredContent).toEqual({
+      primerId: "schemagrep-manifest/v1",
+      primer: "primer:schemagrep-manifest/v1",
+    });
+    expect(batch.structuredContent).toEqual({
+      fileId: FILE_ID,
+      results: [
+        {
+          name: "push_count",
+          result: {
+            query: {
+              mode: "count",
+              target: { path: "/type" },
+              filters: [],
+              value: "push",
+            },
+            answer: "5",
+            outputBytes: 1,
+          },
+        },
+        {
+          name: "failed_metric",
+          error: {
+            code: "internal_error",
+            message: "The query could not be completed",
+          },
+        },
+        {
+          name: "status_count",
+          result: {
+            query: {
+              mode: "count",
+              target: { path: "/status" },
+              filters: [],
+              value: 404,
+            },
+            answer: "5",
+            outputBytes: 1,
+          },
+        },
+      ],
     });
     expect(malformedProjection.isError).toBe(true);
     expect(hidden.isError).toBe(true);

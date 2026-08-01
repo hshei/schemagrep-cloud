@@ -15,8 +15,8 @@ describe("structured query contract", () => {
       mode: "grep",
       target: null,
       filters: [
-        { field: { key: "country_code" }, op: "eq", value: "EU" },
-        { field: { key: "status" }, op: "between", value: [200, 399] },
+        { field: { path: "/country_code" }, op: "eq", value: "EU" },
+        { field: { path: "/status" }, op: "between", value: [200, 399] },
       ],
     });
 
@@ -24,17 +24,17 @@ describe("structured query contract", () => {
       mode: "grep",
       target: null,
       filters: [
-        { field: { key: "country_code" }, op: "eq", value: "EU" },
-        { field: { key: "status" }, op: "between", value: [200, 399] },
+        { field: { path: "/country_code" }, op: "eq", value: "EU" },
+        { field: { path: "/status" }, op: "between", value: [200, 399] },
       ],
       limit: 20,
     });
     expect(buildSchemagrepQueryArgs(query, 21)).toEqual([
       "--grep",
       "--where",
-      "key=country_code:eq:EU",
+      "path=/country_code:eq:EU",
       "--where",
-      "key=status:between:200..399",
+      "path=/status:between:200..399",
       "--limit",
       "21",
     ]);
@@ -43,23 +43,23 @@ describe("structured query contract", () => {
   test("routes numeric exact values through numeric predicate semantics", () => {
     const numeric = parseStructuredQueryRequest({
       mode: "count",
-      target: { key: "status" },
+      target: { path: "/status" },
       filters: [],
       value: 404,
     });
     const nullFilter = parseStructuredQueryRequest({
       mode: "count",
       target: null,
-      filters: [{ field: { key: "latency" }, op: "eq", value: null }],
+      filters: [{ field: { path: "/latency" }, op: "eq", value: null }],
     });
 
     expect(numeric.value).toBe(404);
     expect(buildSchemagrepQueryArgs(numeric)).toEqual([
-      "--count", "--where", "key=status:eq:404",
+      "--count", "--where", "path=/status:eq:404",
     ]);
     expect(nullFilter.filters[0]?.value).toBe("null");
     expect(buildSchemagrepQueryArgs(nullFilter)).toEqual([
-      "--count", "--where", "key=latency:eq:null",
+      "--count", "--where", "path=/latency:eq:null",
     ]);
   });
 
@@ -67,7 +67,7 @@ describe("structured query contract", () => {
     const query = {
       mode: "grep",
       target: null,
-      filters: [{ field: { key: "type" }, op: "eq", value: "push" }],
+      filters: [{ field: { path: "/type" }, op: "eq", value: "push" }],
       limit: 2,
     } satisfies StructuredQueryRequest;
 
@@ -83,18 +83,22 @@ describe("structured query contract", () => {
   test("rejects ambiguous, unbounded, and option-injection-shaped requests", () => {
     const invalidRequests: unknown[] = [
       { mode: "rows", target: null, filters: [], command: "cat" },
-      { mode: "count", target: { key: "type" }, filters: [], value: "--rows" },
-      { mode: "count", target: { key: "--rows" }, filters: [], value: "push" },
-      { mode: "count", target: { key: "payload.size" }, filters: [], value: 10 },
+      { mode: "count", target: { path: "/type" }, filters: [], value: "--rows" },
+      { mode: "count", target: { path: "--rows" }, filters: [], value: "push" },
+      { mode: "count", target: { path: "payload.size" }, filters: [], value: 10 },
+      { mode: "count", target: { col: 0 }, filters: [], value: "push" },
+      { mode: "count", target: { slot: 1 }, filters: [], value: "push" },
+      { mode: "count", target: { key: "type" }, filters: [], value: "push" },
+      { mode: "count", target: null, filters: [{ field: { col: 0 }, op: "eq", value: "push" }] },
       { mode: "count", target: null, filters: [] },
-      { mode: "grep", target: null, filters: [{ field: { key: "id" }, op: "eq", value: "1" }], limit: 101 },
-      { mode: "rows", target: null, filters: [{ field: { key: "id" }, op: "eq", value: "1" }] },
-      { mode: "count", target: null, filters: [{ field: { key: "id" }, op: "between", value: [10, 1] }] },
+      { mode: "grep", target: null, filters: [{ field: { path: "/id" }, op: "eq", value: "1" }], limit: 101 },
+      { mode: "rows", target: null, filters: [{ field: { path: "/id" }, op: "eq", value: "1" }] },
+      { mode: "count", target: null, filters: [{ field: { path: "/id" }, op: "between", value: [10, 1] }] },
       {
         mode: "count",
         target: null,
         filters: Array.from({ length: 9 }, () => ({
-          field: { key: "id" },
+          field: { path: "/id" },
           op: "eq",
           value: "1",
         })),
@@ -106,11 +110,21 @@ describe("structured query contract", () => {
     }
   });
 
-  test("explains that JSON coordinates use leaf keys instead of dotted paths", () => {
+  test("accepts canonical manifest paths without a nesting-depth cap", () => {
+    const deepPath = "/segment".repeat(600);
+    for (const path of ["/payload/size", "/columns/0", "/fields/7", deepPath]) {
+      expect(parseStructuredQueryRequest({
+        mode: "count",
+        target: { path },
+        filters: [],
+        value: "present",
+      }).target).toEqual({ path });
+    }
+
     expect(() => parseStructuredQueryRequest({
       mode: "count",
       target: null,
-      filters: [{ field: { key: "payload.size" }, op: "ge", value: 10 }],
-    })).toThrow("filters[0].field.key must be a leaf key name, not a dotted path; use size for payload.size");
+      filters: [{ field: { path: "payload.size" }, op: "ge", value: 10 }],
+    })).toThrow("filters[0].field.path must be a canonical manifest path");
   });
 });

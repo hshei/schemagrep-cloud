@@ -9,6 +9,8 @@ export interface PublicFileRecord {
   codec: SupportedCodec;
   originalName: string;
   sourceBytes: number;
+  primerId: string;
+  schemaId: string;
   schemaBytes: number;
   createdAt: string;
   expiresAt: string;
@@ -40,6 +42,7 @@ export interface FileService {
   list(ownerId: string): Promise<PublicFileRecord[]>;
   usage(ownerId: string): Promise<TenantFileUsage>;
   get(id: string, ownerId: string): Promise<PublicFileRecord | undefined>;
+  readPrimer(primerId: string): Promise<string>;
   readSchema(id: string, ownerId: string): Promise<string | undefined>;
   query(
     id: string,

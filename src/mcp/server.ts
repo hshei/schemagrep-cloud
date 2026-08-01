@@ -3,19 +3,20 @@ import { z } from "zod";
 import { InvalidQueryError, SchemagrepProcessError } from "../files/errors";
 import { FILE_ID_PATTERN } from "../files/id";
 import type { FileService } from "../files/types";
-import { QUERY_MODES, parseStructuredQueryRequest } from "../query/contract";
+import {
+  parseStructuredQueryRequest,
+  type StructuredQueryResponse,
+} from "../query/contract";
 
-const jsonLeafKeySchema = z.string()
+const canonicalPathSchema = z.string()
   .min(1)
-  .max(256)
-  .regex(/^[^.]+$/, "Use a leaf key name, not a dotted path; use size for payload.size")
-  .describe("JSON/JSONL leaf key name, not a dotted path or JSONPath; use size for payload.size.");
+  .regex(
+    /^(?:\/(?:\*|(?:[^~/%\u0000-\u001f\u007f:*]|~[01]|%[0-9A-F]{2})*))+$/u,
+    "Use the canonical path from the manifest, such as /payload/size",
+  )
+  .describe("Exact field coordinate.path copied from the selected file manifest.");
 
-const queryFieldSchema = z.union([
-  z.strictObject({ col: z.number().int().min(0).max(1_000_000) }),
-  z.strictObject({ slot: z.number().int().min(1).max(1_000_000) }),
-  z.strictObject({ key: jsonLeafKeySchema }),
-]);
+const queryFieldSchema = z.strictObject({ path: canonicalPathSchema });
 
 const exactValueSchema = z.union([
   z.string().max(4096),
@@ -42,34 +43,34 @@ const queryFilterSchema = z.discriminatedUnion("op", [
 ]);
 
 const fileIdSchema = z.string().regex(FILE_ID_PATTERN);
+const primerIdSchema = z.literal("schemagrep-manifest/v1");
+const schemaIdSchema = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 const filtersSchema = z.array(queryFilterSchema).max(8);
 const templateSchema = z.number().int().min(0).max(1_000_000).optional();
 const grepLimitSchema = z.number().int().min(1).max(100).optional()
   .describe('Only for mode "grep".');
+const MAX_QUERY_BATCH_SIZE = 20;
+const MAX_QUERY_BATCH_OUTPUT_BYTES = 1024 * 1024;
 
-const queryToolInputSchema = z.union([
+const queryRequestToolSchema = z.union([
   z.strictObject({
-    fileId: fileIdSchema,
     mode: z.literal("rows"),
     target: z.null(),
     filters: z.array(queryFilterSchema).max(0),
   }),
   z.strictObject({
-    fileId: fileIdSchema,
     mode: z.enum(["min", "max", "distinct", "const"]),
     target: queryFieldSchema,
     filters: z.array(queryFilterSchema).max(0),
     template: templateSchema,
   }),
   z.strictObject({
-    fileId: fileIdSchema,
     mode: z.enum(["sum", "avg", "argmax", "argmin"]),
     target: queryFieldSchema,
     filters: filtersSchema,
     template: templateSchema,
   }),
   z.strictObject({
-    fileId: fileIdSchema,
     mode: z.literal("count"),
     target: queryFieldSchema,
     filters: filtersSchema,
@@ -77,14 +78,12 @@ const queryToolInputSchema = z.union([
     template: templateSchema,
   }),
   z.strictObject({
-    fileId: fileIdSchema,
     mode: z.literal("count"),
     target: z.null(),
     filters: filtersSchema.min(1),
     template: templateSchema,
   }),
   z.strictObject({
-    fileId: fileIdSchema,
     mode: z.literal("grep"),
     target: queryFieldSchema,
     filters: filtersSchema,
@@ -93,7 +92,6 @@ const queryToolInputSchema = z.union([
     template: templateSchema,
   }),
   z.strictObject({
-    fileId: fileIdSchema,
     mode: z.literal("grep"),
     target: z.null(),
     filters: filtersSchema.min(1),
@@ -102,6 +100,17 @@ const queryToolInputSchema = z.union([
   }),
 ]);
 
+const queryToolInputSchema = z.strictObject({
+  fileId: fileIdSchema,
+  queries: z.array(z.strictObject({
+    name: z.string()
+      .min(1)
+      .max(64)
+      .regex(/^[A-Za-z][A-Za-z0-9_-]*$/),
+    request: queryRequestToolSchema,
+  })).min(1).max(MAX_QUERY_BATCH_SIZE),
+});
+
 const fileRecordSchema = z.strictObject({
   id: z.string(),
   status: z.literal("ready"),
@@ -109,21 +118,55 @@ const fileRecordSchema = z.strictObject({
   originalName: z.string(),
   sourceBytes: z.number(),
   schemaBytes: z.number(),
+  primerId: primerIdSchema,
+  schemaId: schemaIdSchema,
   createdAt: z.string(),
   expiresAt: z.string(),
 });
 const listFilesOutputSchema = z.strictObject({
   files: z.array(fileRecordSchema),
 });
+const primerToolOutputSchema = z.strictObject({
+  primerId: primerIdSchema,
+  primer: z.string(),
+});
 
-const schemaToolOutputSchema = z.strictObject({
-  fileId: z.string(),
-  schema: z.string(),
+const schemaToolOutputSchema = z.discriminatedUnion("unchanged", [
+  z.strictObject({
+    fileId: fileIdSchema,
+    primerId: primerIdSchema,
+    schemaId: schemaIdSchema,
+    unchanged: z.literal(false),
+    schema: z.record(z.string(), z.unknown()),
+  }),
+  z.strictObject({
+    fileId: fileIdSchema,
+    primerId: primerIdSchema,
+    schemaId: schemaIdSchema,
+    unchanged: z.literal(true),
+  }),
+]);
+const queryErrorSchema = z.strictObject({
+  code: z.string(),
+  message: z.string(),
 });
 const queryToolOutputSchema = z.strictObject({
   fileId: z.string(),
-  result: z.record(z.string(), z.unknown()),
+  results: z.array(z.union([
+    z.strictObject({
+      name: z.string(),
+      result: z.record(z.string(), z.unknown()),
+    }),
+    z.strictObject({
+      name: z.string(),
+      error: queryErrorSchema,
+    }),
+  ])),
 });
+
+type NamedQueryResult =
+  | { name: string; result: StructuredQueryResponse }
+  | { name: string; error: { code: string; message: string } };
 
 function errorResult(code: string, message: string) {
   return {
@@ -167,7 +210,7 @@ function createTenantServer(
     { name: "schemagrep-cloud", version: "0.0.0" },
     {
       instructions:
-        "Use schemagrep_list_files when the user has not provided a file ID. Once a file is selected, call schemagrep_get_schema exactly once as the first data action; after it succeeds, do not call it again. JSON/JSONL key coordinates are leaf key names, not dotted paths or JSONPath: address payload.size as { key: \"size\" }. Use schema facts directly when conclusive; otherwise use schemagrep_query. For filter-only count or grep, target must be null. grep returns complete matching records, not a projected target field. Use argmax or argmin directly when both the extremum and its count are requested. Set limit only for grep. Never infer a total count from limited grep evidence.",
+        "Use schemagrep_list_files when the user has not provided a file ID. File records advertise immutable primerId and content-addressed schemaId values. Read each primer once with schemagrep_get_primer before interpreting manifests, then cache it by primerId for the conversation. Before the first data query for a selected file, call schemagrep_get_schema. Cache full schema responses by schemaId; when that schemaId is already cached, send it as knownSchemaId so an unchanged response avoids retransmission. Do not fetch a selected file's schema again during follow-up questions unless the earlier call failed or its advertised schemaId changed. Put every independent source operation needed for the current answer into one schemagrep_query call. Every field coordinate is an exact path copied from the manifest: JSON/JSONL paths such as /payload/size, CSV /columns/N paths, or log /fields/N paths. Guesses, leaf keys, and dotted paths are unsupported. Use manifest facts directly when conclusive; otherwise use schemagrep_query. For filter-only count or grep, target must be null. grep returns complete matching records, not a projected target field. Use argmax or argmin directly when both the extremum and its count are requested. Set limit only for grep. Never infer a total count from limited grep evidence.",
     },
   );
 
@@ -195,14 +238,45 @@ function createTenantServer(
       }
     },
   );
+  server.registerTool(
+    "schemagrep_get_primer",
+    {
+      title: "Read schemagrep query primer",
+      description:
+        "Read one immutable, versioned query-protocol primer by the primerId supplied in a file manifest. Cache the successful result by primerId for the conversation; call again only after failure or when a manifest names a different primerId.",
+      inputSchema: z.strictObject({ primerId: primerIdSchema }),
+      outputSchema: primerToolOutputSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ primerId }) => {
+      try {
+        return successfulResult({
+          primerId,
+          primer: await fileService.readPrimer(primerId),
+        });
+      } catch (error) {
+        reportError(error instanceof Error ? error : new Error(String(error)));
+        return errorResult("internal_error", "The query primer could not be read");
+      }
+    },
+  );
+
 
   server.registerTool(
     "schemagrep_get_schema",
     {
       title: "Read schemagrep schema",
       description:
-        "Read the schema and query primer for a tenant-owned uploaded file. Call exactly once as the first action. After this succeeds, do not call it again in the same question.",
-      inputSchema: z.strictObject({ fileId: z.string().regex(FILE_ID_PATTERN) }),
+        "Read a tenant-owned file's compact manifest. Cache full responses by schemaId. If knownSchemaId is already cached, supply it to receive unchanged=true without retransmitting the schema.",
+      inputSchema: z.strictObject({
+        fileId: fileIdSchema,
+        knownSchemaId: schemaIdSchema.optional(),
+      }),
       outputSchema: schemaToolOutputSchema,
       annotations: {
         readOnlyHint: true,
@@ -211,13 +285,29 @@ function createTenantServer(
         openWorldHint: false,
       },
     },
-    async ({ fileId }) => {
+    async ({ fileId, knownSchemaId }) => {
       try {
+        const file = await fileService.get(fileId, tenantId);
+        if (file === undefined) {
+          return errorResult("file_not_found", "File does not exist or has expired");
+        }
+        const identity = {
+          fileId,
+          primerId: file.primerId,
+          schemaId: file.schemaId,
+        };
+        if (knownSchemaId === file.schemaId) {
+          return successfulResult({ ...identity, unchanged: true as const });
+        }
         const schema = await fileService.readSchema(fileId, tenantId);
         if (schema === undefined) {
           return errorResult("file_not_found", "File does not exist or has expired");
         }
-        return successfulResult({ fileId, schema });
+        return successfulResult({
+          ...identity,
+          unchanged: false as const,
+          schema: JSON.parse(schema) as Record<string, unknown>,
+        });
       } catch (error) {
         reportError(error instanceof Error ? error : new Error(String(error)));
         return errorResult("internal_error", "The schema could not be read");
@@ -230,7 +320,7 @@ function createTenantServer(
     {
       title: "Query an uploaded file",
       description:
-        "Run one deterministic query. Modes: rows returns the total; count/grep accept either target+value, or target=null with one or more filters. For filter-only count/grep, target MUST be null; grep returns complete matching records and does not use target for projection. min/max/distinct/const use a target and no filters. sum/avg/argmax/argmin use a target and may use ANDed filters; argmax/argmin return the extremum and its count in one call. CSV fields use col, logs use slot, and JSON/JSONL use a leaf key name or slot. Dotted paths and JSONPath are unsupported: use key size, not payload.size. limit is legal only for grep.",
+        "Run 1-20 named deterministic queries in one call; group every independent operation needed for the current answer into this batch. Each request supports: rows for the total; count/grep with target+value or target=null plus filters; min/max/distinct/const with an unfiltered target; and sum/avg/argmax/argmin with a target and optional ANDed filters. argmax/argmin return the extremum and count together. Copy every target or filter path exactly from its manifest field coordinate: JSON/JSONL paths such as /payload/size, CSV /columns/N paths, or log /fields/N paths. Never guess from a name or pattern. limit is legal only for grep. A failed operation returns an error beside its name without discarding successful sibling results. Combined result data is capped at 1 MiB.",
       inputSchema: queryToolInputSchema,
       outputSchema: queryToolOutputSchema,
       annotations: {
@@ -240,15 +330,41 @@ function createTenantServer(
         openWorldHint: false,
       },
     },
-    async (input) => {
-      const { fileId, ...request } = input;
+    async ({ fileId, queries }) => {
       try {
-        const query = parseStructuredQueryRequest(request);
-        const result = await fileService.query(fileId, tenantId, query);
-        if (result === undefined) {
-          return errorResult("file_not_found", "File does not exist or has expired");
+        if (new Set(queries.map(({ name }) => name)).size !== queries.length) {
+          throw new InvalidQueryError("Query names must be unique within one batch");
         }
-        return successfulResult({ fileId, result });
+        const planned = queries.map(({ name, request }) => ({
+          name,
+          query: parseStructuredQueryRequest(request),
+        }));
+        const results: NamedQueryResult[] = [];
+        let outputBytes = 0;
+        for (const { name, query } of planned) {
+          let result: StructuredQueryResponse | undefined;
+          try {
+            result = await fileService.query(fileId, tenantId, query);
+          } catch (error) {
+            if (!(error instanceof InvalidQueryError)) {
+              reportError(error instanceof Error ? error : new Error(String(error)));
+            }
+            results.push({ name, error: queryFailure(error) });
+            continue;
+          }
+          if (result === undefined) {
+            return errorResult("file_not_found", "File does not exist or has expired");
+          }
+          outputBytes += result.outputBytes;
+          if (outputBytes > MAX_QUERY_BATCH_OUTPUT_BYTES) {
+            return errorResult(
+              "query_output_too_large",
+              "Combined query output exceeds the 1 MiB MCP batch limit",
+            );
+          }
+          results.push({ name, result });
+        }
+        return successfulResult({ fileId, results });
       } catch (error) {
         if (!(error instanceof InvalidQueryError)) {
           reportError(error instanceof Error ? error : new Error(String(error)));

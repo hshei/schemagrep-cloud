@@ -38,6 +38,8 @@ class TenantFileService implements FileService {
       originalName: source.filename,
       sourceBytes: 9,
       schemaBytes: 9,
+      primerId: "schemagrep-manifest/v1",
+      schemaId: `sha256:${"0".repeat(64)}`,
       createdAt: "2026-07-29T00:00:00.000Z",
       expiresAt: "2026-07-29T01:00:00.000Z",
     };
@@ -64,6 +66,10 @@ class TenantFileService implements FileService {
   async get(id: string, ownerId: string): Promise<PublicFileRecord | undefined> {
     const owned = this.files.get(id);
     return owned?.ownerId === ownerId ? owned.record : undefined;
+  }
+
+  async readPrimer(primerId: string): Promise<string> {
+    return `primer:${primerId}`;
   }
 
   async readSchema(id: string, ownerId: string): Promise<string | undefined> {

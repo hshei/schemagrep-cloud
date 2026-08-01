@@ -64,7 +64,7 @@ bun run cloud -- login --server https://schemagrep.hani-labs.com
 bun run cloud -- upload ./events.jsonl
 bun run cloud -- files
 bun run cloud -- schema --latest
-bun run cloud -- query --latest --mode count --key type --value push
+bun run cloud -- query --latest --mode count --path /type --value push
 bun run cloud -- query --latest --mode rows
 bun run cloud -- delete --latest
 bun run cloud -- logout
@@ -87,15 +87,19 @@ UPLOAD=$(curl -sS -F "file=@vendor/schemagrep/samples/jsonl/qtest.jsonl" \
 FILE_ID=$(printf '%s' "$UPLOAD" | jq -r '.id')
 curl -sS "http://127.0.0.1:3000/v1/files/$FILE_ID/schema"
 curl -sS -H "Content-Type: application/json" \
-  --data '{"mode":"count","target":{"key":"type"},"value":"push","filters":[]}' \
+  --data '{"mode":"count","target":{"path":"/type"},"value":"push","filters":[]}' \
   "http://127.0.0.1:3000/v1/files/$FILE_ID/query" | jq
 ```
 
 The query contract accepts `rows`, `count`, `grep`, `min`, `max`, `sum`, `avg`,
-`argmax`, `argmin`, `distinct`, and `const`. A target or filter field is
-`{"col":N}` for CSV, `{"slot":N}` for logs, and `{"slot":N}` or `{"key":"name"}`
-for JSON/JSONL. Up to eight filters are combined with AND. `grep` has a required
-bounded result limit from 1 to 100 (default 20) and reports exact truncation.
+`argmax`, `argmin`, `distinct`, and `const`. Every target and filter uses only
+the exact canonical `coordinate.path` copied from the selected manifest:
+JSON/JSONL paths such as `{"path":"/payload/size"}`, zero-based CSV paths such
+as `{"path":"/columns/1"}`, or one-based log paths such as
+`{"path":"/fields/7"}`. Up to eight filters are combined with AND. `grep` has
+a bounded result limit from 1 to 100 (default 20) and reports exact truncation.
+Canonical paths have no hard-coded nesting-depth or byte-length cap; request,
+upload, artifact, and schema quotas remain the service resource boundaries.
 
 ## Connect a customer-owned model through MCP
 
@@ -106,7 +110,7 @@ Configure only the remote Streamable HTTP endpoint:
   "mcpServers": {
     "schemagrep": {
       "type": "http",
-      "url": "https://schemagrep.example.com/mcp"
+      "url": "https://schemagrep.hani-labs.com/mcp"
     }
   }
 }
@@ -117,17 +121,25 @@ authorization with PKCE, sends the MCP resource indicator, and refreshes its
 access token. The client must support remote Streamable HTTP MCP and OAuth.
 
 The endpoint supports the current 2026 Streamable HTTP protocol and the
-stateless 2025 fallback. It exposes three read-only tools:
+stateless 2025 fallback. It exposes four read-only tools:
 
 | Tool | Purpose |
 |---|---|
-| `schemagrep_list_files` | List the signed-in user's active uploads |
-| `schemagrep_get_schema` | Read a user-owned file's schema and query primer |
-| `schemagrep_query` | Execute the validated, bounded query contract |
+| `schemagrep_list_files` | List the signed-in user's active uploads and schema identities |
+| `schemagrep_get_primer` | Read one immutable query-protocol primer, reusable by `primerId` |
+| `schemagrep_get_schema` | Read a compact manifest or confirm a cached `schemaId` is unchanged |
+| `schemagrep_query` | Execute 1-20 named, validated queries in one bounded call |
 
 Upload through the dashboard or terminal, then ask about the file by name or
 ID. The customer's model account performs inference; schemagrep-cloud receives
 no model-provider credential.
+
+Agents should cache primers by `primerId` and full manifests by `schemaId`.
+Follow-up schema checks send `knownSchemaId` and receive `unchanged: true`
+without retransmitting the manifest. Agents should batch all independent
+counts, aggregates, extrema, and bounded record lookups needed for one answer
+into one `schemagrep_query` call; an operation error is returned by name
+without discarding successful sibling results.
 
 ## Routes
 
@@ -218,9 +230,9 @@ The provided deployment targets one Ubuntu 24.04 LTS server in Ashburn:
 
 Create a WorkOS project and AuthKit application. Configure:
 
-1. sign-in callback: `https://schemagrep.example.com/callback`;
-2. sign-out return URI: `https://schemagrep.example.com`;
-3. MCP OAuth resource: `https://schemagrep.example.com/mcp`;
+1. sign-in callback: `https://schemagrep.hani-labs.com/callback`;
+2. sign-out return URI: `https://schemagrep.hani-labs.com`;
+3. MCP OAuth resource: `https://schemagrep.hani-labs.com/mcp`;
 4. OAuth scopes: `openid` and `offline_access`;
 5. Client ID Metadata Document support for public MCP clients.
 
@@ -281,7 +293,6 @@ sudoedit /etc/schemagrep-cloud.env
 
 sudo cp deploy/schemagrep-cloud.service /etc/systemd/system/
 sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
-sudoedit /etc/caddy/Caddyfile  # replace the example domain and ACME email
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now schemagrep-cloud
@@ -296,8 +307,8 @@ client-supplied value in that header.
 ### 4. Verify and operate
 
 ```bash
-curl -fsS https://schemagrep.example.com/health
-curl -fsS https://schemagrep.example.com/ready
+curl -fsS https://schemagrep.hani-labs.com/health
+curl -fsS https://schemagrep.hani-labs.com/ready
 journalctl -u schemagrep-cloud -f
 ```
 

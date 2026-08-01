@@ -14,6 +14,8 @@ const FILE: PublicFileRecord = {
   originalName: "events.jsonl",
   sourceBytes: 100,
   schemaBytes: 50,
+  primerId: "schemagrep-manifest/v1",
+  schemaId: `sha256:${"0".repeat(64)}`,
   createdAt: "2026-07-30T00:00:00.000Z",
   expiresAt: "2026-07-30T01:00:00.000Z",
 };
@@ -37,6 +39,10 @@ class ManagedIdentityFileService implements FileService {
       ? FILE
       : undefined;
   }
+  async readPrimer(primerId: string): Promise<string> {
+    return `primer:${primerId}`;
+  }
+
   async readSchema(id: string, ownerId: string): Promise<string | undefined> {
     return id === FILE.id && ["oauth-tenant", "browser-tenant"].includes(ownerId)
       ? "[schema]\n"

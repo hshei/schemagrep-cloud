@@ -6,15 +6,11 @@ import type {
 } from "./contract";
 
 function coordinateArgument(field: QueryField): [string, string] {
-  if ("col" in field) return ["--col", String(field.col)];
-  if ("slot" in field) return ["--slot", String(field.slot)];
-  return ["--key", field.key];
+  return ["--path", field.path];
 }
 
 function filterCoordinate(field: QueryField): string {
-  if ("col" in field) return `col=${field.col}`;
-  if ("slot" in field) return `slot=${field.slot}`;
-  return `key=${field.key}`;
+  return `path=${field.path}`;
 }
 
 function filterValue(filter: QueryFilter): string {

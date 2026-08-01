@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { extname, join } from "node:path";
 import {
@@ -40,7 +40,7 @@ import type {
   UploadSource,
 } from "./types";
 
-const FILE_RECORD_VERSION = 1;
+const FILE_RECORD_VERSION = 2;
 const MAX_METADATA_BYTES = 64 * 1024;
 const FILES_DIRECTORY = "files";
 const METADATA_FILENAME = "metadata.json";
@@ -53,6 +53,48 @@ const CODECS_BY_EXTENSION: Readonly<Record<string, SupportedCodec>> = {
   ".ndjson": "jsonl",
   ".txt": "log",
 };
+const MANIFEST_FORMAT = "schemagrep-manifest/v1";
+const PRIMER_ID = "schemagrep-manifest/v1";
+const SCHEMA_ID_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
+interface SchemaIdentity {
+  primerId: string;
+  schemaId: string;
+  bytes: number;
+}
+
+async function inspectSchemaManifest(
+  schemaPath: string,
+  expectedCodec: SupportedCodec,
+): Promise<SchemaIdentity> {
+  const bytes = await readFile(schemaPath);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    throw new Error("Schemagrep produced an invalid compact manifest");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("Schemagrep produced an invalid compact manifest");
+  }
+  const manifest = parsed as Record<string, unknown>;
+  if (
+    manifest.format !== MANIFEST_FORMAT ||
+    manifest.primerId !== PRIMER_ID ||
+    manifest.codec !== expectedCodec ||
+    !Number.isSafeInteger(manifest.records) ||
+    (manifest.records as number) < 0 ||
+    !Array.isArray(manifest.fields)
+  ) {
+    throw new Error("Schemagrep produced an unsupported compact manifest");
+  }
+  return {
+    primerId: PRIMER_ID,
+    schemaId: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+    bytes: bytes.byteLength,
+  };
+}
+
 
 interface PersistedFileRecord {
   version: typeof FILE_RECORD_VERSION;
@@ -64,16 +106,25 @@ interface PersistedFileRecord {
   originalName: string;
   sourceBytes: number;
   schemaBytes: number;
+  primerId: string;
+  schemaId: string;
   createdAt: string;
   expiresAt: string;
 }
 
 function validateQueryCoordinate(field: QueryField, codec: SupportedCodec): void {
-  const supported =
-    (codec === "csv" && "col" in field) ||
-    (codec === "log" && "slot" in field) ||
-    ((codec === "json" || codec === "jsonl") && !("col" in field));
-  if (!supported) throw new InvalidQueryError(`Field coordinate is not supported for ${codec} files`);
+  if (codec === "csv") {
+    const match = /^\/columns\/(0|[1-9][0-9]*)$/u.exec(field.path);
+    if (match === null || !Number.isSafeInteger(Number(match[1]))) {
+      throw new InvalidQueryError("CSV field paths must match /columns/N using a zero-based position");
+    }
+  }
+  if (codec === "log") {
+    const match = /^\/fields\/([1-9][0-9]*)$/u.exec(field.path);
+    if (match === null || !Number.isSafeInteger(Number(match[1]))) {
+      throw new InvalidQueryError("Log field paths must match /fields/N using a one-based position");
+    }
+  }
 }
 
 function validateQueryForCodec(
@@ -198,7 +249,7 @@ export class PersistentFileService implements FileService {
     const directory = join(this.filesDirectory, id);
     const sourcePath = join(directory, `source${extension}`);
     const artifactPath = join(directory, "artifact.sg");
-    const schemaPath = join(directory, "schema.txt");
+    const schemaPath = join(directory, "schema.json");
 
     try {
       await mkdir(directory, { mode: 0o700 });
@@ -215,6 +266,10 @@ export class PersistentFileService implements FileService {
       const artifactBytes = await this.options.runner.encode(sourcePath, artifactPath);
       await rm(sourcePath, { force: true });
       const schemaBytes = await this.options.runner.schema(artifactPath, schemaPath);
+      const schemaIdentity = await inspectSchemaManifest(schemaPath, codec);
+      if (schemaIdentity.bytes !== schemaBytes) {
+        throw new Error("Schemagrep schema byte count does not match its output");
+      }
       const retainedBytes = artifactBytes + schemaBytes;
       await this.assertFreeSpace();
 
@@ -235,6 +290,8 @@ export class PersistentFileService implements FileService {
         codec,
         originalName: safeName,
         sourceBytes: limiter.bytesWritten,
+        primerId: schemaIdentity.primerId,
+        schemaId: schemaIdentity.schemaId,
         schemaBytes,
         createdAt: new Date(createdAtMs).toISOString(),
         expiresAt: new Date(createdAtMs + this.options.fileTtlMs).toISOString(),
@@ -290,6 +347,10 @@ export class PersistentFileService implements FileService {
     return record === undefined || record.ownerId !== ownerId
       ? undefined
       : this.toPublicRecord(record);
+  }
+
+  readPrimer(primerId: string): Promise<string> {
+    return this.options.runner.primer(primerId);
   }
 
   async readSchema(id: string, ownerId: string): Promise<string | undefined> {
@@ -420,6 +481,9 @@ export class PersistentFileService implements FileService {
       typeof value.schemaBytes !== "number" ||
       !Number.isSafeInteger(value.schemaBytes) ||
       value.schemaBytes < 0 ||
+      value.primerId !== PRIMER_ID ||
+      typeof value.schemaId !== "string" ||
+      !SCHEMA_ID_PATTERN.test(value.schemaId) ||
       typeof value.retainedBytes !== "number" ||
       !Number.isSafeInteger(value.retainedBytes) ||
       value.retainedBytes <= 0 ||
@@ -435,7 +499,7 @@ export class PersistentFileService implements FileService {
     if (expectedCodec !== codec) throw new Error("Persisted codec does not match filename");
 
     const artifactPath = join(directory, "artifact.sg");
-    const schemaPath = join(directory, "schema.txt");
+    const schemaPath = join(directory, "schema.json");
     const [artifactStats, schemaStats] = await Promise.all([stat(artifactPath), stat(schemaPath)]);
     if (
       !artifactStats.isFile() ||
@@ -445,6 +509,14 @@ export class PersistentFileService implements FileService {
     ) {
       throw new Error("Persisted artifact size does not match metadata");
     }
+    const schemaIdentity = await inspectSchemaManifest(schemaPath, codec as SupportedCodec);
+    if (
+      schemaIdentity.primerId !== value.primerId ||
+      schemaIdentity.schemaId !== value.schemaId ||
+      schemaIdentity.bytes !== value.schemaBytes
+    ) {
+      throw new Error("Persisted schema identity does not match metadata");
+    }
     return {
       ownerId: value.ownerId,
       retainedBytes: value.retainedBytes,
@@ -453,6 +525,8 @@ export class PersistentFileService implements FileService {
       codec: codec as SupportedCodec,
       originalName: value.originalName,
       sourceBytes: value.sourceBytes,
+      primerId: value.primerId,
+      schemaId: value.schemaId,
       schemaBytes: value.schemaBytes,
       createdAt: value.createdAt,
       expiresAt: value.expiresAt,
@@ -473,6 +547,8 @@ export class PersistentFileService implements FileService {
       originalName: record.originalName,
       sourceBytes: record.sourceBytes,
       schemaBytes: record.schemaBytes,
+      primerId: record.primerId,
+      schemaId: record.schemaId,
       createdAt: record.createdAt,
       expiresAt: record.expiresAt,
     };
@@ -558,6 +634,8 @@ export class PersistentFileService implements FileService {
       codec: record.codec,
       originalName: record.originalName,
       sourceBytes: record.sourceBytes,
+      primerId: record.primerId,
+      schemaId: record.schemaId,
       schemaBytes: record.schemaBytes,
       createdAt: record.createdAt,
       expiresAt: record.expiresAt,
