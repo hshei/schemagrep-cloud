@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,8 +15,20 @@ import {
 import { PersistentFileService } from "../src/files/service";
 import type { SchemagrepProcessor } from "../src/schemagrep/runner";
 import type { StructuredQueryRequest } from "../src/query/contract";
+const COMPACT_SCHEMA = `${JSON.stringify({
+  format: "schemagrep-manifest/v1",
+  primerId: "schemagrep-manifest/v1",
+  codec: "jsonl",
+  records: 1,
+  topLevel: ["/id"],
+  fields: [],
+})}\n`;
+const SCHEMA_BYTES = Buffer.byteLength(COMPACT_SCHEMA);
+const RETAINED_BYTES = Buffer.byteLength('encoded:{"id":1}\n') + SCHEMA_BYTES;
+
 
 class FakeProcessor implements SchemagrepProcessor {
+  constructor(private readonly compactSchema: string = COMPACT_SCHEMA) {}
   encodeCalls = 0;
   schemaCalls = 0;
   lastQueryArgs: readonly string[] | undefined;
@@ -31,10 +44,13 @@ class FakeProcessor implements SchemagrepProcessor {
   async schema(artifactPath: string, outputPath: string): Promise<number> {
     this.schemaCalls += 1;
     this.schemaInput = await readFile(artifactPath, "utf8");
-    const schema = "[schema]\n";
-    await writeFile(outputPath, schema, { flag: "wx", mode: 0o600 });
-    return Buffer.byteLength(schema);
+    await writeFile(outputPath, this.compactSchema, { flag: "wx", mode: 0o600 });
+    return Buffer.byteLength(this.compactSchema);
   }
+  async primer(primerId: string): Promise<string> {
+    return `primer:${primerId}`;
+  }
+
 
   async query(_artifactPath: string, args: readonly string[]): Promise<string> {
     this.lastQueryArgs = args;
@@ -88,12 +104,14 @@ describe("PersistentFileService", () => {
 
     expect(record.originalName).toBe("events.jsonl");
     expect(record.sourceBytes).toBe(9);
-    expect(record.schemaBytes).toBe(9);
-    expect(await service.readSchema(record.id, OWNER_ID)).toBe("[schema]\n");
+    expect(record.schemaBytes).toBe(SCHEMA_BYTES);
+    expect(record.primerId).toBe("schemagrep-manifest/v1");
+    expect(record.schemaId).toBe(`sha256:${createHash("sha256").update(COMPACT_SCHEMA).digest("hex")}`);
+    expect(await service.readSchema(record.id, OWNER_ID)).toBe(COMPACT_SCHEMA);
     expect(runner.schemaInput).toBe('encoded:{"id":1}\n');
     const query: StructuredQueryRequest = {
       mode: "count",
-      target: { key: "id" },
+      target: { path: "/id" },
       filters: [],
       value: "1",
     };
@@ -102,7 +120,7 @@ describe("PersistentFileService", () => {
       answer: "5",
       outputBytes: 1,
     });
-    expect(runner.lastQueryArgs).toEqual(["--count", "1", "--key", "id"]);
+    expect(runner.lastQueryArgs).toEqual(["--count", "1", "--path", "/id"]);
     expect(await service.query(record.id, "tenant-b", query)).toBeUndefined();
     expect(await service.get(record.id, "tenant-b")).toBeUndefined();
     expect(await service.readSchema(record.id, "tenant-b")).toBeUndefined();
@@ -113,12 +131,82 @@ describe("PersistentFileService", () => {
     expect(await readdir(storageBaseDirectory)).toEqual(["files"]);
     expect(await readdir(filesDirectory)).toEqual([record.id]);
     const retainedArtifacts = (await readdir(join(filesDirectory, record.id))).sort();
-    expect(retainedArtifacts).toEqual(["artifact.sg", "metadata.json", "schema.txt"]);
+    expect(retainedArtifacts).toEqual(["artifact.sg", "metadata.json", "schema.json"]);
 
     now += 1001;
     expect(await service.get(record.id, OWNER_ID)).toBeUndefined();
     expect(await readdir(filesDirectory)).toEqual([]);
     await service.close();
+  });
+
+  test("accepts canonical field paths for CSV and log artifacts", async () => {
+    const cases = [
+      {
+        codec: "csv",
+        filename: "events.csv",
+        source: "status\n200\n",
+        path: "/columns/0",
+        invalidPath: "/fields/1",
+      },
+      {
+        codec: "log",
+        filename: "events.log",
+        source: "status=200\n",
+        path: "/fields/1",
+        invalidPath: "/columns/0",
+      },
+    ] as const;
+
+    for (const item of cases) {
+      const storageBaseDirectory = await mkdtemp(
+        join(tmpdir(), `schemagrep-${item.codec}-query-test-`),
+      );
+      temporaryDirectories.push(storageBaseDirectory);
+      const compactSchema = `${JSON.stringify({
+        format: "schemagrep-manifest/v1",
+        primerId: "schemagrep-manifest/v1",
+        codec: item.codec,
+        records: 1,
+        fields: [{ coordinate: { path: item.path } }],
+      })}\n`;
+      const runner = new FakeProcessor(compactSchema);
+      const service = new PersistentFileService({
+        storageBaseDirectory,
+        fileTtlMs: 60_000,
+        maxUploadBytes: 1024,
+        maxTenantStorageBytes: 4096,
+        ...CAPACITY,
+        runner,
+      });
+      const record = await service.ingest(
+        {
+          filename: item.filename,
+          stream: Readable.from([item.source]),
+          wasTruncated: () => false,
+        },
+        OWNER_ID,
+      );
+      const query: StructuredQueryRequest = {
+        mode: "count",
+        target: { path: item.path },
+        filters: [],
+        value: "200",
+      };
+      await expect(service.query(record.id, OWNER_ID, query)).resolves.toMatchObject({
+        answer: "5",
+      });
+      expect(runner.lastQueryArgs).toEqual([
+        "--count",
+        "200",
+        "--path",
+        item.path,
+      ]);
+      await expect(service.query(record.id, OWNER_ID, {
+        ...query,
+        target: { path: item.invalidPath },
+      })).rejects.toThrow(item.codec === "csv" ? "/columns/N" : "/fields/N");
+      await service.close();
+    }
   });
 
   test("reloads active file metadata and artifacts after restart", async () => {
@@ -156,15 +244,56 @@ describe("PersistentFileService", () => {
     });
     const query: StructuredQueryRequest = { mode: "rows", target: null, filters: [] };
     expect(await restarted.list(OWNER_ID)).toEqual([record]);
-    expect(await restarted.readSchema(record.id, OWNER_ID)).toBe("[schema]\n");
+    expect(await restarted.readSchema(record.id, OWNER_ID)).toBe(COMPACT_SCHEMA);
     expect(await restarted.query(record.id, OWNER_ID, query)).toMatchObject({ answer: "5" });
     expect(await restarted.usage(OWNER_ID)).toMatchObject({
       activeFiles: 1,
       sourceBytes: 9,
-      retainedBytes: 26,
+      retainedBytes: RETAINED_BYTES,
     });
     expect(runner.encodeCalls).toBe(0);
     expect(runner.schemaCalls).toBe(0);
+    await restarted.close();
+  });
+
+  test("rejects a persisted compact manifest whose content hash changed", async () => {
+    const storageBaseDirectory = await mkdtemp(join(tmpdir(), "schemagrep-service-test-"));
+    temporaryDirectories.push(storageBaseDirectory);
+    const now = Date.parse("2026-07-29T00:00:00.000Z");
+    const first = new PersistentFileService({
+      storageBaseDirectory,
+      fileTtlMs: 60_000,
+      maxUploadBytes: 1024,
+      maxTenantStorageBytes: 4096,
+      ...CAPACITY,
+      runner: new FakeProcessor(),
+      now: () => now,
+    });
+    const record = await first.ingest(
+      {
+        filename: "events.jsonl",
+        stream: Readable.from(['{"id":1}\n']),
+        wasTruncated: () => false,
+      },
+      OWNER_ID,
+    );
+    await first.close();
+    await writeFile(
+      join(storageBaseDirectory, "files", record.id, "schema.json"),
+      COMPACT_SCHEMA.replace('"records":1', '"records":2'),
+    );
+
+    const restarted = new PersistentFileService({
+      storageBaseDirectory,
+      fileTtlMs: 60_000,
+      maxUploadBytes: 1024,
+      maxTenantStorageBytes: 4096,
+      ...CAPACITY,
+      runner: new FakeProcessor(),
+      now: () => now,
+    });
+    expect(await restarted.list(OWNER_ID)).toEqual([]);
+    expect(await readdir(join(storageBaseDirectory, "files"))).toEqual([]);
     await restarted.close();
   });
 
@@ -233,7 +362,7 @@ describe("PersistentFileService", () => {
       storageBaseDirectory,
       fileTtlMs: 1000,
       maxUploadBytes: 1024,
-      maxTenantStorageBytes: 30,
+      maxTenantStorageBytes: RETAINED_BYTES * 2 - 1,
       runner: new FakeProcessor(),
       ...CAPACITY,
     });

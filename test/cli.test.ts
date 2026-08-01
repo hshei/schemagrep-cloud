@@ -44,8 +44,12 @@ describe("cloud CLI guidance", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain("query <FILE_ID|--latest> --mode MODE");
-    expect(result.stdout).toContain("query --latest --mode count --key type --value push");
+    expect(result.stdout).toContain("query --latest --mode count --path /type --value push");
     expect(result.stdout).not.toContain("\\\n");
+    expect(result.stdout).toContain("Coordinate: --path POINTER");
+    expect(result.stdout).not.toContain("--key");
+    expect(result.stdout).not.toContain("--col");
+    expect(result.stdout).not.toContain("--slot");
   });
 
   test("diagnoses whitespace-only arguments before authentication", async () => {
@@ -63,6 +67,24 @@ describe("cloud CLI guidance", () => {
     expect(result.exitCode).toBe(1);
     expect(result.stdout).toBe("");
     expect(result.stderr).toContain("Unknown arguments: --bogus");
+  });
+
+  test("rejects removed query coordinate flags before authentication", async () => {
+    for (const [flag, value] of [["--key", "type"], ["--col", "0"], ["--slot", "1"]] as const) {
+      const result = await runCli(
+        "query",
+        "file_0123456789abcdef0123456789abcdef",
+        "--mode",
+        "count",
+        flag,
+        value,
+        "--value",
+        "push",
+      );
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain(`Unknown arguments: ${flag} ${value}`);
+    }
   });
 
   test("discovers Client ID Metadata Document login without a hard-coded client ID", async () => {

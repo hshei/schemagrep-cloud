@@ -151,11 +151,11 @@ function commandHelp(command?: string): string {
   if (command === "query") {
     return [
       "Usage: bun run cloud -- query <FILE_ID|--latest> --mode MODE [options] [--json]",
-      "Coordinates: --key NAME | --slot N | --col N",
+      "Coordinate: --path POINTER",
       "Options: --value VALUE, --where JSON, --limit N, --template N, --request JSON",
       "Examples:",
-      "  bun run cloud -- query --latest --mode count --key type --value push",
-      "  bun run cloud -- query --latest --mode max --key status",
+      "  bun run cloud -- query --latest --mode count --path /type --value push",
+      "  bun run cloud -- query --latest --mode max --path /payload/size",
     ].join("\n");
   }
   if (command === "delete") return "Usage: bun run cloud -- delete <FILE_ID|--latest> [--json]";
@@ -637,19 +637,9 @@ function buildQuery(args: string[]): Record<string, unknown> {
     if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("--request must be a JSON object");
     return value as Record<string, unknown>;
   }
-  const mode = requireArgument(option(args, "--mode"), "query FILE_ID --mode MODE [--key NAME|--slot N|--col N]");
-  const key = option(args, "--key");
-  const slot = option(args, "--slot");
-  const col = option(args, "--col");
-  const coordinates = [key, slot, col].filter((value) => value !== undefined);
-  if (coordinates.length > 1) throw new Error("Use exactly one of --key, --slot, or --col");
-  const target = key !== undefined
-    ? { key }
-    : slot !== undefined
-      ? { slot: Number(slot) }
-      : col !== undefined
-        ? { col: Number(col) }
-        : null;
+  const mode = requireArgument(option(args, "--mode"), "query FILE_ID --mode MODE [--path POINTER]");
+  const path = option(args, "--path");
+  const target = path === undefined ? null : { path };
   const filters = options(args, "--where").map((value) => JSON.parse(value));
   const value = option(args, "--value");
   const limit = option(args, "--limit");
@@ -725,7 +715,7 @@ function printUpload(response: Record<string, unknown>, json: boolean): void {
   console.log("");
   console.log("Next:");
   console.log(`  bun run cloud -- schema ${id}`);
-  console.log(`  bun run cloud -- query ${id} --mode count --key FIELD --value VALUE`);
+  console.log(`  bun run cloud -- query ${id} --mode count --path /FIELD --value VALUE`);
   console.log("  Or use --latest instead of the file ID.");
 }
 

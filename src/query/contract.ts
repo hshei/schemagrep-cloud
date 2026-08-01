@@ -15,7 +15,7 @@ export const QUERY_MODES = [
 ] as const;
 
 export type QueryMode = (typeof QUERY_MODES)[number];
-export type QueryField = { col: number } | { slot: number } | { key: string };
+export type QueryField = { path: string };
 export type QueryFilter =
   | { field: QueryField; op: "eq" | "ne"; value: string }
   | { field: QueryField; op: "gt" | "ge" | "lt" | "le"; value: number }
@@ -68,8 +68,8 @@ const TARGET_MODES = new Set<QueryMode>([
 const NUMERIC_OPERATORS = new Set(["gt", "ge", "lt", "le"]);
 const MAX_FILTERS = 8;
 const MAX_QUERY_STRING_BYTES = 4096;
-const MAX_QUERY_COORDINATE = 1_000_000;
 const MAX_GREP_LIMIT = 100;
+const MAX_TEMPLATE_ID = 1_000_000;
 
 function invalid(message: string): never {
   throw new InvalidQueryError(message);
@@ -92,36 +92,18 @@ function rejectUnknownKeys(
 
 function parseCoordinate(value: unknown, context: string): QueryField {
   if (!isObject(value)) invalid(`${context} must identify one field`);
-  rejectUnknownKeys(value, ["col", "slot", "key"], context);
+  rejectUnknownKeys(value, ["path"], context);
   const entries = Object.entries(value);
-  if (entries.length !== 1) invalid(`${context} must contain exactly one of col, slot, or key`);
+  if (entries.length !== 1) invalid(`${context} must contain exactly one path`);
 
-  const [kind, coordinate] = entries[0]!;
-  if (kind === "key") {
-    if (typeof coordinate === "string" && coordinate.includes(".")) {
-      invalid(`${context}.key must be a leaf key name, not a dotted path; use size for payload.size`);
-    }
-    if (
-      typeof coordinate !== "string" ||
-      Buffer.byteLength(coordinate, "utf8") === 0 ||
-      Buffer.byteLength(coordinate, "utf8") > 256 ||
-      /[\u0000-\u001f\u007f:]/u.test(coordinate) ||
-      coordinate.startsWith("--")
-    ) {
-      invalid(`${context}.key is invalid`);
-    }
-    return { key: coordinate };
-  }
-
-  const minimum = kind === "slot" ? 1 : 0;
+  const coordinate = value.path;
   if (
-    !Number.isSafeInteger(coordinate) ||
-    (coordinate as number) < minimum ||
-    (coordinate as number) > MAX_QUERY_COORDINATE
+    typeof coordinate !== "string" ||
+    !/^(?:\/(?:\*|(?:[^~/%\u0000-\u001f\u007f:*]|~[01]|%[0-9A-F]{2})*))+$/u.test(coordinate)
   ) {
-    invalid(`${context}.${kind} must be an integer from ${minimum} to ${MAX_QUERY_COORDINATE}`);
+    invalid(`${context}.path must be a canonical manifest path`);
   }
-  return kind === "col" ? { col: coordinate as number } : { slot: coordinate as number };
+  return { path: coordinate };
 }
 
 function parseString(value: unknown, context: string, rejectLeadingFlag: boolean): string {
@@ -223,10 +205,10 @@ export function parseStructuredQueryRequest(input: unknown): StructuredQueryRequ
     if (
       !Number.isSafeInteger(input.template) ||
       (input.template as number) < 0 ||
-      (input.template as number) > MAX_QUERY_COORDINATE ||
+      (input.template as number) > MAX_TEMPLATE_ID ||
       mode === "rows"
     ) {
-      invalid(`template must be an integer from 0 to ${MAX_QUERY_COORDINATE}`);
+      invalid(`template must be an integer from 0 to ${MAX_TEMPLATE_ID}`);
     }
     template = input.template as number;
   }

@@ -1,5 +1,4 @@
 {
-	email operator@example.com
 	servers {
 		trusted_proxies static private_ranges
 		client_ip_headers X-Forwarded-For X-Real-IP
@@ -7,7 +6,7 @@
 	}
 }
 
-schemagrep.example.com {
+schemagrep.hani-labs.com {
 	encode zstd gzip
 
 	request_body {
