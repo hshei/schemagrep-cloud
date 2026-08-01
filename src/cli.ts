@@ -305,7 +305,8 @@ async function saveCredentials(credentials: Credentials): Promise<void> {
 }
 
 async function requestJson(url: string, init?: RequestInit): Promise<Record<string, unknown>> {
-  const response = await fetch(url, { ...init, signal: init?.signal ?? AbortSignal.timeout(30_000) });
+  const signal = init?.signal === null ? null : init?.signal ?? AbortSignal.timeout(30_000);
+  const response = await fetch(url, { ...init, signal });
   const text = await response.text();
   let body: unknown;
   try {
@@ -792,7 +793,11 @@ async function main(): Promise<void> {
     rejectUnknownArguments(args);
     const form = new FormData();
     form.append("file", await openAsBlob(path), basename(path));
-    const response = await authenticatedRequest("/v1/files", { method: "POST", body: form });
+    const response = await authenticatedRequest("/v1/files", {
+      method: "POST",
+      body: form,
+      signal: null,
+    });
     printUpload(response, json);
   } else if (command === "schema") {
     const fileId = await resolveFileArgument(args, "schema <FILE_ID|--latest>");
